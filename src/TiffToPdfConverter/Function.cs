@@ -6,13 +6,14 @@ using System.Text;
 using System.Text.Json;
 using System.IO;
 using System;
-using System.Drawing;
 
 using Amazon.Lambda.Core;
 using Amazon.Lambda.APIGatewayEvents;
 using Aspose.Pdf;
 using Aspose.Pdf.Devices;
 using Aspose.Pdf.Text;
+
+// REMOVED: using System.Drawing; - Not compatible with AWS Lambda
 
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
@@ -156,26 +157,6 @@ namespace TiffToPdfConverter
                     };
                 }).ToArray();
 
-                // Debug: Log sample parsed entries to understand the data structure
-                context?.Logger?.LogInformation($"Debug: Total parsed entries: {parsedEntries.Length}");
-                foreach (var entry in parsedEntries.Take(3))
-                {
-                    if (entry.parsedData != null)
-                    {
-                        context?.Logger?.LogInformation($"Debug: Sample entry - Batch: '{entry.parsedData.batch_number}', Item: '{entry.parsedData.item_number}', Type: '{entry.parsedData.payment_type}', File: '{entry.parsedData.file_name}'");
-                    }
-                    else
-                    {
-                        context?.Logger?.LogInformation($"Debug: Entry with null parsedData - FieldCount: {entry.fieldCount}, Raw: '{entry.rawContent}'");
-                    }
-                }
-
-                // Debug: Log how many entries pass the grouping filters
-                var validForGrouping = parsedEntries.Where(entry => entry.parsedData != null && 
-                       !string.IsNullOrEmpty(entry.parsedData.batch_number) &&
-                       !string.IsNullOrEmpty(entry.parsedData.item_number)).ToArray();
-                context?.Logger?.LogInformation($"Debug: Entries valid for grouping: {validForGrouping.Length}");
-
                 // Group by batch_number and item_number and collect M filenames
                 var groupedByBatchNumberAnditem_number = parsedEntries
                     .Where(entry => entry.parsedData != null && 
@@ -207,17 +188,6 @@ namespace TiffToPdfConverter
                         }
                     );
 
-                // Debug: Log grouped results
-                context?.Logger?.LogInformation($"Debug: Total groups created: {groupedByBatchNumberAnditem_number.Count}");
-                foreach (var group in groupedByBatchNumberAnditem_number.Take(3))
-                {
-                    context?.Logger?.LogInformation($"Debug: Group '{group.Key}': C files = {group.Value.cFilenames.Length}, M files = {group.Value.mFilenames.Length}");
-                    if (group.Value.cFilenames.Length > 0)
-                        context?.Logger?.LogInformation($"Debug:   C files: {string.Join(", ", group.Value.cFilenames)}");
-                    if (group.Value.mFilenames.Length > 0)
-                        context?.Logger?.LogInformation($"Debug:   M files: {string.Join(", ", group.Value.mFilenames)}");
-                }
-
                 // Create summary of ALL filenames (C and M) by batch_number and item_number for PDF creation
                 var allFilenamesByBatchNumberAnditem_number = groupedByBatchNumberAnditem_number
                     .Where(kvp => !string.IsNullOrEmpty(kvp.Key))
@@ -235,11 +205,10 @@ namespace TiffToPdfConverter
                     );
 
                 // Debug: Log the allFilenamesByBatchNumberAnditem_number with actual values
-                context.Logger.LogInformation($"allFilenamesByBatchNumberAnditem_number: {JsonSerializer.Serialize(allFilenamesByBatchNumberAnditem_number, new JsonSerializerOptions { WriteIndented = true })}");
-                context.Logger.LogInformation($"mFilenamesByBatchNumberAnditem_number: {JsonSerializer.Serialize(mFilenamesByBatchNumberAnditem_number, new JsonSerializerOptions { WriteIndented = true })}");
+                context?.Logger?.LogInformation($"allFilenamesByBatchNumberAnditem_number: {JsonSerializer.Serialize(allFilenamesByBatchNumberAnditem_number, new JsonSerializerOptions { WriteIndented = true })}");
     
                 // Create merged PDFs from ALL TIFF files (C and M together)
-                var pdfCreationResult = CreateMergedPdfs(allFilenamesByBatchNumberAnditem_number);
+                var pdfCreationResult = CreateMergedPdfs(allFilenamesByBatchNumberAnditem_number, context);
 
                 // Convert to JSON structure with CSV parsing and grouping
                 var jsonData = new
@@ -282,22 +251,11 @@ namespace TiffToPdfConverter
             }
         }
 
-        private static (bool success, Dictionary<string, string> createdPdfs, string error) CreateMergedPdfs(Dictionary<string, string[]> allFilenamesByGroup)
+        private static (bool success, Dictionary<string, string> createdPdfs, string error) CreateMergedPdfs(Dictionary<string, string[]> allFilenamesByGroup, ILambdaContext context = null)
         {
             try
             {
-                // Try to set Aspose license (skip for performance)
-                // try 
-                // {
-                //     SetAsposeLicense();
-                // }
-                // catch (Exception licEx)
-                // {
-                //     System.Diagnostics.Debug.WriteLine($"License setup failed (continuing without license): {licEx.Message}");
-                // }
-                
-                // Skip basic functionality test for performance - proceed directly
-                System.Diagnostics.Debug.WriteLine("Skipping Aspose.PDF basic functionality test for performance");
+                context?.Logger?.LogInformation("Starting PDF creation process");
                 
                 var createdPdfs = new Dictionary<string, string>();
                 string tifFilesPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "M_TIF_Files");
@@ -318,219 +276,123 @@ namespace TiffToPdfConverter
                     return (false, null, "allFilenamesByGroup is empty");
                 }
 
-                // Process each group safely
+                // Process each group
                 foreach (var kvp in allFilenamesByGroup)
                 {
                     string groupKey = kvp.Key;
                     string[] tiffFilenames = kvp.Value;
                     
-                    // Debug logging - skip null or empty keys
+                    // Skip null or empty keys
                     if (string.IsNullOrWhiteSpace(groupKey))
                     {
-                        System.Diagnostics.Debug.WriteLine("Warning: Skipping group with null or empty key");
-                        continue; // Skip null/empty keys
+                        context?.Logger?.LogInformation("Warning: Skipping group with null or empty key");
+                        continue;
                     }
                     
                     if (tiffFilenames == null || tiffFilenames.Length == 0)
                     {
-                        continue; // Skip groups with no TIFF files
+                        context?.Logger?.LogInformation($"Warning: No files for group {groupKey}");
+                        continue;
                     }
 
-                    // Create PDF document for this group with minimal setup
+                    context?.Logger?.LogInformation($"Processing group {groupKey} with {tiffFilenames.Length} files");
+                    
                     Document pdfDocument = null;
                     try 
                     {
+                        // Create PDF document for this group
                         pdfDocument = new Document();
-                    }
-                    catch (Exception docEx)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"Failed to create Document for group {groupKey}: {docEx.Message}");
-                        throw new InvalidOperationException($"Cannot create PDF document for group {groupKey}: {docEx.Message}", docEx);
-                    }
-                    
-                    // Process each TIFF file in the group (both C and M files) - LIMITED FOR PERFORMANCE
-                    System.Diagnostics.Debug.WriteLine($"Processing group {groupKey} with {tiffFilenames.Length} files");
-                    int processedFiles = 0;
-                    int maxFilesPerGroup = 10; // Limit files per group for performance
-                    
-                    foreach (string tiffFilename in tiffFilenames.Take(maxFilesPerGroup))
-                    {
-                        // Try to find the TIFF file with different extensions (.tiff, .tif, etc.)
-                        string actualTiffPath = FindTiffFile(tifFilesPath, tiffFilename);
+                        int processedFiles = 0;
                         
-                        if (actualTiffPath != null && IsTiffFile(actualTiffPath))
+                        // Process each TIFF file in the group (both C and M files)
+                        foreach (string tiffFilename in tiffFilenames)
                         {
-                            try
+                            // Try to find the TIFF file with different extensions
+                            string actualTiffPath = FindTiffFile(tifFilesPath, tiffFilename);
+                            
+                            if (actualTiffPath != null && File.Exists(actualTiffPath))
                             {
-                                ProcessTiffFile(pdfDocument, actualTiffPath, $"Group {groupKey}");
-                                processedFiles++;
+                                try
+                                {
+                                    // Create a new page for each TIFF file
+                                    var page = pdfDocument.Pages.Add();
+                                    
+                                    // Add TIFF image directly using Aspose.PDF
+                                    var image = new Aspose.Pdf.Image();
+                                    image.File = actualTiffPath;
+                                    
+                                    // Set image to fit the page with margins
+                                    image.FixWidth = page.PageInfo.Width - 72; // 36pt margin on each side
+                                    image.FixHeight = page.PageInfo.Height - 72; // 36pt margin top/bottom
+                                    
+                                    page.Paragraphs.Add(image);
+                                    processedFiles++;
+                                    
+                                    context?.Logger?.LogInformation($"Added {Path.GetFileName(actualTiffPath)} to group {groupKey}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    // Log error but continue processing other files
+                                    context?.Logger?.LogInformation($"Warning: Failed to process {Path.GetFileName(actualTiffPath)}: {ex.Message}");
+                                }
                             }
-                            catch (Exception ex)
+                            else
                             {
-                                // Log error but continue processing other files
-                                // Note: In Lambda, detailed error info will be in CloudWatch logs
-                                System.Diagnostics.Debug.WriteLine($"Warning: Failed to process {Path.GetFileName(actualTiffPath)}: {ex.Message}");
+                                context?.Logger?.LogInformation($"Warning: TIFF file not found: {tiffFilename}");
                             }
                         }
-                        else
-                        {
-                            System.Diagnostics.Debug.WriteLine($"Warning: TIFF file not found (tried .tiff/.tif extensions): {tiffFilename}");
-                        }
-                    }
-                    
-                    if (tiffFilenames.Length > maxFilesPerGroup)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"WARNING: Limited processing to {maxFilesPerGroup} files out of {tiffFilenames.Length} for performance");
-                    }
-                    
-                    System.Diagnostics.Debug.WriteLine($"Processed {processedFiles}/{Math.Min(tiffFilenames.Length, maxFilesPerGroup)} files for group {groupKey}");
-                    
-                    // If no pages were added, add an empty page to prevent errors
-                    if (pdfDocument.Pages.Count == 0)
-                    {
-                        var emptyPage = pdfDocument.Pages.Add();
-                        // Add a text note about missing files
-                        var textFragment = new Aspose.Pdf.Text.TextFragment($"No valid TIFF files found for group {groupKey}. Expected files: {string.Join(", ", tiffFilenames)}");
-                        emptyPage.Paragraphs.Add(textFragment);
-                    }
-                    
-                    // Save the merged PDF to temp directory (only writable location in Lambda)
-                    string outputFileName = $"merged_{groupKey}.pdf";
-                    string outputDir = Path.Combine(Path.GetTempPath(), "OUTPUT");
-                    
-                    // Ensure OUTPUT directory exists in temp
-                    Directory.CreateDirectory(outputDir);
-                    
-                    string outputPath = Path.Combine(outputDir, outputFileName);
-                    
-                    try
-                    {
-                        // Validate PDF document before saving
+                        
+                        context?.Logger?.LogInformation($"Processed {processedFiles}/{tiffFilenames.Length} files for group {groupKey}");
+                        
+                        // If no pages were added, add a placeholder page
                         if (pdfDocument.Pages.Count == 0)
                         {
-                            throw new InvalidOperationException($"PDF document for group {groupKey} has no pages");
+                            var emptyPage = pdfDocument.Pages.Add();
+                            var textFragment = new Aspose.Pdf.Text.TextFragment($"No valid TIFF files found for group {groupKey}");
+                            emptyPage.Paragraphs.Add(textFragment);
+                            context?.Logger?.LogInformation($"Added placeholder page for group {groupKey}");
                         }
                         
-                        // Save to temp directory (only writable location in Lambda)
+                        // Save the merged PDF to temp directory
+                        string outputFileName = $"{groupKey}_Merged.pdf";
+                        string outputDir = Path.Combine(Path.GetTempPath(), "OUTPUT");
+                        
+                        // Ensure OUTPUT directory exists
+                        Directory.CreateDirectory(outputDir);
+                        
+                        string outputPath = Path.Combine(outputDir, outputFileName);
+                        
+                        // Save the PDF
                         pdfDocument.Save(outputPath);
-                    }
-                    catch (Exception saveEx)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"Primary save failed for group {groupKey}: {saveEx.Message}");
                         
-                        // Fallback: Create the most minimal PDF possible
-                        try
-                        {
-                            // Clean up the problematic document
-                            try { pdfDocument.Dispose(); } catch { }
-                            
-                            // Create a completely new, minimal document
-                            using (var fallbackDocument = new Document())
-                            {
-                                // Add a single empty page with minimal configuration
-                                var fallbackPage = fallbackDocument.Pages.Add();
-                                
-                                // Try to add text, but if that fails, just save empty PDF
-                                try 
-                                {
-                                    var textFragment = new Aspose.Pdf.Text.TextFragment($"Group: {groupKey} - Processing failed");
-                                    fallbackPage.Paragraphs.Add(textFragment);
-                                }
-                                catch 
-                                {
-                                    // If even text fails, just keep the empty page
-                                    System.Diagnostics.Debug.WriteLine($"Text addition failed for group {groupKey}, creating empty PDF");
-                                }
-                                
-                                // Save the fallback document
-                                fallbackDocument.Save(outputPath);
-                            }
-                            
-                            System.Diagnostics.Debug.WriteLine($"Created fallback PDF for group {groupKey}");
-                        }
-                        catch (Exception fallbackEx)
-                        {
-                            // Last resort: Create a dummy file so the process doesn't completely fail
-                            try 
-                            {
-                                File.WriteAllText(outputPath.Replace(".pdf", ".txt"), $"PDF creation failed for group {groupKey}. Primary error: {saveEx.Message}. Fallback error: {fallbackEx.Message}");
-                                // Create a minimal valid PDF manually if possible
-                                File.WriteAllBytes(outputPath, new byte[] { 0x25, 0x50, 0x44, 0x46, 0x2D }); // "%PDF-" header
-                            }
-                            catch { }
-                            
-                            throw new InvalidOperationException($"Complete PDF creation failure for group {groupKey}. Primary: {saveEx.Message}, Fallback: {fallbackEx.Message}", saveEx);
-                        }
+                        // Get file info
+                        var fileInfo = new FileInfo(outputPath);
+                        createdPdfs[groupKey] = $"Path: {outputPath}, Size: {fileInfo.Length} bytes, Pages: {pdfDocument.Pages.Count}";
+                        
+                        context?.Logger?.LogInformation($"Successfully created PDF for group {groupKey} at {outputPath}");
                     }
-                    
-                    // Read the PDF content and encode as base64 for download
-                    byte[] pdfBytes = File.ReadAllBytes(outputPath);
-                    string base64Content = Convert.ToBase64String(pdfBytes);
-                    
-                    // Note: PDFs are saved to /tmp/OUTPUT (temporary, inside Lambda container)
-                    
-                    // Use TryAdd to avoid duplicate key issues  
-                    try
+                    catch (Exception ex)
                     {
-                        if (!string.IsNullOrWhiteSpace(groupKey) && !createdPdfs.ContainsKey(groupKey))
-                        {
-                            createdPdfs.Add(groupKey, $"Path: {outputPath}, Size: {pdfBytes.Length} bytes");
-                        }
+                        context?.Logger?.LogInformation($"Error processing group {groupKey}: {ex.Message}");
+                        // Continue with next group
                     }
-                    catch (Exception dictEx)
+                    finally
                     {
-                        System.Diagnostics.Debug.WriteLine($"Warning: Failed to add PDF info to dictionary for group '{groupKey}': {dictEx.Message}");
+                        // Clean up
+                        pdfDocument?.Dispose();
                     }
-                    
-                    // Only dispose if not already disposed in fallback
-                    try { pdfDocument.Dispose(); } catch { /* Already disposed */ }
+                }
+                
+                if (createdPdfs.Count == 0)
+                {
+                    return (false, null, "No PDFs were successfully created");
                 }
                 
                 return (true, createdPdfs, null);
             }
             catch (Exception ex)
             {
-                return (false, null, $"Error creating merged PDFs: {ex.Message} - StackTrace: {ex.StackTrace}");
-            }
-        }
-
-        private static void SetAsposeLicense()
-        {
-            try
-            {
-                // Uncomment and provide your license file path
-                // var license = new Aspose.Pdf.License();
-                // license.SetLicense("path/to/your/Aspose.Pdf.lic");
-                System.Diagnostics.Debug.WriteLine("✓ Aspose license applied successfully");
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"⚠ License not applied: {ex.Message}");
-            }
-        }
-
-        private static bool TestAsposePdfBasicFunctionality()
-        {
-            try
-            {
-                // Test the most basic PDF creation
-                using (var testDoc = new Document())
-                {
-                    var testPage = testDoc.Pages.Add();
-                    var testPath = Path.Combine(Path.GetTempPath(), $"aspose_test_{Guid.NewGuid()}.pdf");
-                    testDoc.Save(testPath);
-                    
-                    // Clean up test file
-                    try { File.Delete(testPath); } catch { }
-                    
-                    System.Diagnostics.Debug.WriteLine("✓ Aspose.PDF basic functionality test passed");
-                    return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"✗ Aspose.PDF basic functionality test failed: {ex.Message}");
-                return false;
+                return (false, null, $"Error creating merged PDFs: {ex.Message}");
             }
         }
 
@@ -575,147 +437,6 @@ namespace TiffToPdfConverter
 
             string extension = Path.GetExtension(filePath).ToLowerInvariant();
             return extension == ".tiff" || extension == ".tif";
-        }
-
-        private static (double width, double height) CalculateImageDimensions(int imageWidth, int imageHeight, Page page)
-        {
-            // Get page dimensions (accounting for margins)
-            var pageRect = page.GetPageRect(true);
-            double pageWidth = pageRect.Width - 40; // 20pt margin on each side
-            double pageHeight = pageRect.Height - 40; // 20pt margin on top and bottom
-            
-            // Calculate scale factors
-            double scaleX = pageWidth / imageWidth;
-            double scaleY = pageHeight / imageHeight;
-            
-            // Use the smaller scale factor to maintain aspect ratio
-            double scale = Math.Min(scaleX, scaleY);
-            
-            return (imageWidth * scale, imageHeight * scale);
-        }
-
-        private static void ProcessTiffFile(Document document, string tiffPath, string description)
-        {
-            try
-            {
-                // Validate file exists and is a TIFF file
-                if (!File.Exists(tiffPath))
-                    throw new FileNotFoundException($"TIFF file not found: {tiffPath}");
-
-                if (!IsTiffFile(tiffPath))
-                    throw new ArgumentException($"File is not a TIFF file: {Path.GetFileName(tiffPath)}");
-
-                // Load the TIFF image to check frame count
-                using (var tiffImage = new Bitmap(tiffPath))
-                {
-                    int frameCount = tiffImage.GetFrameCount(System.Drawing.Imaging.FrameDimension.Page);
-
-                    // Ensure we have at least one frame
-                    if (frameCount == 0)
-                        throw new InvalidOperationException($"TIFF file contains no frames: {Path.GetFileName(tiffPath)}");
-
-                    // Process each frame (limit to first 3 frames for performance)
-                    int maxFramesToProcess = Math.Min(frameCount, 3);
-                    for (int frameIndex = 0; frameIndex < maxFramesToProcess; frameIndex++)
-                    {
-                        // Select the current frame
-                        tiffImage.SelectActiveFrame(System.Drawing.Imaging.FrameDimension.Page, frameIndex);
-
-                        // Validate image dimensions before creating page
-                        if (tiffImage.Width <= 0 || tiffImage.Height <= 0)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"Warning: Invalid image dimensions {tiffImage.Width}x{tiffImage.Height} for frame {frameIndex}");
-                            continue;
-                        }
-
-                        // Create a new page in the PDF document 
-                        var page = document.Pages.Add();
-
-                        // Calculate dimensions to fit the page while maintaining aspect ratio
-                        var (width, height) = CalculateImageDimensions(tiffImage.Width, tiffImage.Height, page);
-                        
-                        // Validate calculated dimensions
-                        if (width <= 0 || height <= 0)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"Warning: Invalid calculated dimensions {width}x{height} for frame {frameIndex}");
-                            // Remove the page we just added since we can't use it
-                            document.Pages.Delete(document.Pages.Count);
-                            continue;
-                        }
-
-                        // Try direct TIFF approach first, fallback to PNG if needed
-                        bool imageAdded = false;
-                        
-                        // Method 1: Try using the original TIFF file directly if it's a single frame
-                        if (frameCount == 1)
-                        {
-                            try 
-                            {
-                                var image = new Aspose.Pdf.Image();
-                                image.File = tiffPath;
-                                                                image.FixWidth = width;
-                                image.FixHeight = height;
-                                page.Paragraphs.Add(image);
-                                imageAdded = true;
-                            }
-                            catch (Exception ex)
-                            {
-                                System.Diagnostics.Debug.WriteLine($"Direct TIFF failed for {tiffPath}: {ex.Message}");
-                            }
-                        }
-                        
-                        // Method 2: Fallback to PNG conversion approach
-                        if (!imageAdded)
-                        {
-                            try
-                            {
-                                // Convert current frame to PNG bytes
-                                byte[] imageBytes;
-                                using (var imageStream = new MemoryStream())
-                                {
-                                    tiffImage.Save(imageStream, System.Drawing.Imaging.ImageFormat.Png);
-                                    imageBytes = imageStream.ToArray();
-                                }
-
-                                // Validate that we have image data
-                                if (imageBytes == null || imageBytes.Length == 0)
-                                {
-                                    throw new InvalidOperationException("No image data generated");
-                                }
-
-                                // Save to temporary file and use file path
-                                string tempImagePath = Path.Combine(Path.GetTempPath(), $"temp_frame_{Guid.NewGuid()}.png");
-                                File.WriteAllBytes(tempImagePath, imageBytes);
-                                
-                                var image = new Aspose.Pdf.Image();
-                                image.File = tempImagePath;
-                                                                image.FixWidth = width;
-                                image.FixHeight = height;
-                                page.Paragraphs.Add(image);
-                                
-                                // Clean up temp file
-                                try { File.Delete(tempImagePath); } catch { }
-                                imageAdded = true;
-                            }
-                            catch (Exception imgEx)
-                            {
-                                System.Diagnostics.Debug.WriteLine($"PNG conversion failed for frame {frameIndex}: {imgEx.Message}");
-                            }
-                        }
-                        
-                        // If both methods failed, remove the page
-                        if (!imageAdded)
-                        {
-                            document.Pages.Delete(document.Pages.Count);
-                            System.Diagnostics.Debug.WriteLine($"Warning: Failed to add any image for frame {frameIndex}");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException($"Failed to process {description} - {Path.GetFileName(tiffPath)}: {ex.Message}", ex);
-            }
         }
 
         private static async Task<(bool success, string content, string error, long size)> DownloadIndexFile(string path)
