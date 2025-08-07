@@ -13,8 +13,6 @@ using Aspose.Pdf;
 using Aspose.Pdf.Devices;
 using Aspose.Pdf.Text;
 
-// REMOVED: using System.Drawing; - Not compatible with AWS Lambda
-
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
@@ -30,14 +28,66 @@ namespace TiffToPdfConverter
         private const string INDEX_FILE = "INDEX_FILE"; // Directory containing the index file
         private static readonly HttpClient client = new HttpClient();
 
+        /// <summary>
+        /// Sets the Aspose.PDF license from a license file.
+        /// </summary>
+        /// <param name="licenseFilePath">Path to the license file. If null, looks for 'Aspose.Total.lic' in the application directory.</param>
+        /// <returns>True if license was set successfully, false otherwise.</returns>
+        public static bool SetAsposeLicense(string licenseFilePath = null)
+        {
+            try
+            {
+                // Default license file path if not provided
+                if (string.IsNullOrEmpty(licenseFilePath))
+                {
+                    licenseFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Aspose.Total.lic");
+                }
+
+                // Check if license file exists
+                if (!File.Exists(licenseFilePath))
+                {
+                    // Try alternative common license file names
+                    string[] alternativeNames = { "Aspose.PDF.lic", "license.lic", "Aspose.lic" };
+                    string baseDirectory = Path.GetDirectoryName(licenseFilePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+                    
+                    foreach (string altName in alternativeNames)
+                    {
+                        string altPath = Path.Combine(baseDirectory, altName);
+                        if (File.Exists(altPath))
+                        {
+                            licenseFilePath = altPath;
+                            break;
+                        }
+                    }
+                    
+                    // If still not found, return false
+                    if (!File.Exists(licenseFilePath))
+                    {
+                        return false;
+                    }
+                }
+
+                // Set the license
+                var license = new Aspose.Pdf.License();
+                license.SetLicense(licenseFilePath);
+                
+                return true;
+            }
+            catch (Exception)
+            {
+                // License setting failed
+                return false;
+            }
+        }
+
         private static async Task<string> GetCallingIP()
         {
             client.DefaultRequestHeaders.Accept.Clear();
             client.DefaultRequestHeaders.Add("User-Agent", "AWS Lambda .Net Client");
 
-            var msg = await client.GetStringAsync("http://checkip.amazonaws.com/").ConfigureAwait(continueOnCapturedContext:false);
+            var msg = await client.GetStringAsync("http://checkip.amazonaws.com/").ConfigureAwait(continueOnCapturedContext: false);
 
-            return msg.Replace("\n","");
+            return msg.Replace("\n", "");
         }
 
         public static string[] ParseCsvLine(string csvLine)
@@ -45,11 +95,11 @@ namespace TiffToPdfConverter
             var fields = new List<string>();
             var currentField = new StringBuilder();
             bool inQuotes = false;
-            
+
             for (int i = 0; i < csvLine.Length; i++)
             {
                 char c = csvLine[i];
-                
+
                 if (c == '"')
                 {
                     if (inQuotes && i + 1 < csvLine.Length && csvLine[i + 1] == '"')
@@ -75,10 +125,10 @@ namespace TiffToPdfConverter
                     currentField.Append(c);
                 }
             }
-            
+
             // Add the last field
             fields.Add(currentField.ToString());
-            
+
             return fields.ToArray();
         }
 
@@ -88,7 +138,7 @@ namespace TiffToPdfConverter
             {
                 // Look for index file inside the INDEX_FILE directory
                 string indexDirectoryPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, INDEX_FILE);
-                
+
                 if (!Directory.Exists(indexDirectoryPath))
                 {
                     return (false, null, $"Index directory not found at: {indexDirectoryPath}");
@@ -115,7 +165,7 @@ namespace TiffToPdfConverter
                 }
 
                 var content = await File.ReadAllTextAsync(indexFilePath);
-                
+
                 // Parse the content - assuming it's CSV-like data
                 var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                                   .Select(line => line.Trim())
@@ -123,11 +173,11 @@ namespace TiffToPdfConverter
                                   .ToList();
 
                 // Parse all entries first
-                var parsedEntries = lines.Select((line, index) => 
+                var parsedEntries = lines.Select((line, index) =>
                 {
                     var fields = ParseCsvLine(line);
-                    
-                    return new 
+
+                    return new
                     {
                         lineNumber = index + 1,
                         rawContent = line,
@@ -159,7 +209,7 @@ namespace TiffToPdfConverter
 
                 // Group by batch_number and item_number and collect M filenames
                 var groupedByBatchNumberAnditem_number = parsedEntries
-                    .Where(entry => entry.parsedData != null && 
+                    .Where(entry => entry.parsedData != null &&
                            !string.IsNullOrEmpty(entry.parsedData.batch_number) &&
                            !string.IsNullOrEmpty(entry.parsedData.item_number))
                     .GroupBy(entry => new { entry.parsedData.batch_number, entry.parsedData.item_number })
@@ -172,14 +222,14 @@ namespace TiffToPdfConverter
                             totalFiles = group.Count(),
                             mFilenames = group
                                 .Where(entry => !string.IsNullOrWhiteSpace(entry.parsedData.payment_type) &&
-                                              entry.parsedData.payment_type.Trim().Equals("M", StringComparison.OrdinalIgnoreCase) && 
+                                              entry.parsedData.payment_type.Trim().Equals("M", StringComparison.OrdinalIgnoreCase) &&
                                               !string.IsNullOrWhiteSpace(entry.parsedData.file_name) &&
                                               entry.parsedData.file_name.Trim().StartsWith("M", StringComparison.OrdinalIgnoreCase))
                                 .Select(entry => entry.parsedData.file_name.Trim())
                                 .ToArray(),
                             cFilenames = group
                                 .Where(entry => !string.IsNullOrWhiteSpace(entry.parsedData.payment_type) &&
-                                              entry.parsedData.payment_type.Trim().Equals("C", StringComparison.OrdinalIgnoreCase) && 
+                                              entry.parsedData.payment_type.Trim().Equals("C", StringComparison.OrdinalIgnoreCase) &&
                                               !string.IsNullOrWhiteSpace(entry.parsedData.file_name) &&
                                               entry.parsedData.file_name.Trim().StartsWith("C", StringComparison.OrdinalIgnoreCase))
                                 .Select(entry => entry.parsedData.file_name.Trim())
@@ -206,7 +256,7 @@ namespace TiffToPdfConverter
 
                 // Debug: Log the allFilenamesByBatchNumberAnditem_number with actual values
                 context?.Logger?.LogInformation($"allFilenamesByBatchNumberAnditem_number: {JsonSerializer.Serialize(allFilenamesByBatchNumberAnditem_number, new JsonSerializerOptions { WriteIndented = true })}");
-    
+
                 // Create merged PDFs from ALL TIFF files (C and M together)
                 var pdfCreationResult = CreateMergedPdfs(allFilenamesByBatchNumberAnditem_number, context);
 
@@ -251,15 +301,15 @@ namespace TiffToPdfConverter
             }
         }
 
-        private static (bool success, Dictionary<string, string> createdPdfs, string error) CreateMergedPdfs(Dictionary<string, string[]> allFilenamesByGroup, ILambdaContext context = null)
+        /*private static (bool success, Dictionary<string, string> createdPdfs, string error) CreateMergedPdfs(Dictionary<string, string[]> allFilenamesByGroup, ILambdaContext context = null)
         {
             try
             {
                 context?.Logger?.LogInformation("Starting PDF creation process");
-                
+
                 var createdPdfs = new Dictionary<string, string>();
                 string tifFilesPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "M_TIF_Files");
-                
+
                 if (!Directory.Exists(tifFilesPath))
                 {
                     return (false, null, $"TIFF files directory not found at: {tifFilesPath}");
@@ -270,7 +320,7 @@ namespace TiffToPdfConverter
                 {
                     return (false, null, "allFilenamesByGroup is null");
                 }
-                
+
                 if (allFilenamesByGroup.Count == 0)
                 {
                     return (false, null, "allFilenamesByGroup is empty");
@@ -281,14 +331,14 @@ namespace TiffToPdfConverter
                 {
                     string groupKey = kvp.Key;
                     string[] tiffFilenames = kvp.Value;
-                    
+
                     // Skip null or empty keys
                     if (string.IsNullOrWhiteSpace(groupKey))
                     {
                         context?.Logger?.LogInformation("Warning: Skipping group with null or empty key");
                         continue;
                     }
-                    
+
                     if (tiffFilenames == null || tiffFilenames.Length == 0)
                     {
                         context?.Logger?.LogInformation($"Warning: No files for group {groupKey}");
@@ -296,38 +346,38 @@ namespace TiffToPdfConverter
                     }
 
                     context?.Logger?.LogInformation($"Processing group {groupKey} with {tiffFilenames.Length} files");
-                    
+
                     Document pdfDocument = null;
-                    try 
+                    try
                     {
                         // Create PDF document for this group
                         pdfDocument = new Document();
                         int processedFiles = 0;
-                        
+
                         // Process each TIFF file in the group (both C and M files)
                         foreach (string tiffFilename in tiffFilenames)
                         {
                             // Try to find the TIFF file with different extensions
                             string actualTiffPath = FindTiffFile(tifFilesPath, tiffFilename);
-                            
+
                             if (actualTiffPath != null && File.Exists(actualTiffPath))
                             {
                                 try
                                 {
                                     // Create a new page for each TIFF file
                                     var page = pdfDocument.Pages.Add();
-                                    
+
                                     // Add TIFF image directly using Aspose.PDF
                                     var image = new Aspose.Pdf.Image();
                                     image.File = actualTiffPath;
-                                    
+
                                     // Set image to fit the page with margins
                                     image.FixWidth = page.PageInfo.Width - 72; // 36pt margin on each side
                                     image.FixHeight = page.PageInfo.Height - 72; // 36pt margin top/bottom
-                                    
+
                                     page.Paragraphs.Add(image);
                                     processedFiles++;
-                                    
+
                                     context?.Logger?.LogInformation($"Added {Path.GetFileName(actualTiffPath)} to group {groupKey}");
                                 }
                                 catch (Exception ex)
@@ -341,9 +391,9 @@ namespace TiffToPdfConverter
                                 context?.Logger?.LogInformation($"Warning: TIFF file not found: {tiffFilename}");
                             }
                         }
-                        
+
                         context?.Logger?.LogInformation($"Processed {processedFiles}/{tiffFilenames.Length} files for group {groupKey}");
-                        
+
                         // If no pages were added, add a placeholder page
                         if (pdfDocument.Pages.Count == 0)
                         {
@@ -352,23 +402,23 @@ namespace TiffToPdfConverter
                             emptyPage.Paragraphs.Add(textFragment);
                             context?.Logger?.LogInformation($"Added placeholder page for group {groupKey}");
                         }
-                        
+
                         // Save the merged PDF to temp directory
                         string outputFileName = $"{groupKey}_Merged.pdf";
                         string outputDir = Path.Combine(Path.GetTempPath(), "OUTPUT");
-                        
+
                         // Ensure OUTPUT directory exists
                         Directory.CreateDirectory(outputDir);
-                        
+
                         string outputPath = Path.Combine(outputDir, outputFileName);
-                        
+
                         // Save the PDF
                         pdfDocument.Save(outputPath);
-                        
+
                         // Get file info
                         var fileInfo = new FileInfo(outputPath);
                         createdPdfs[groupKey] = $"Path: {outputPath}, Size: {fileInfo.Length} bytes, Pages: {pdfDocument.Pages.Count}";
-                        
+
                         context?.Logger?.LogInformation($"Successfully created PDF for group {groupKey} at {outputPath}");
                     }
                     catch (Exception ex)
@@ -382,17 +432,170 @@ namespace TiffToPdfConverter
                         pdfDocument?.Dispose();
                     }
                 }
-                
+
                 if (createdPdfs.Count == 0)
                 {
                     return (false, null, "No PDFs were successfully created");
                 }
-                
+
                 return (true, createdPdfs, null);
             }
             catch (Exception ex)
             {
                 return (false, null, $"Error creating merged PDFs: {ex.Message}");
+            }
+        }*/
+        private static (bool success, Dictionary<string, string> createdPdfs, string error) CreateMergedPdfs(Dictionary<string, string[]> allFilenamesByGroup, ILambdaContext context = null)
+        {
+            try
+            {
+                context?.Logger?.LogInformation("Starting PDF creation process");
+
+                var createdPdfs = new Dictionary<string, string>();
+                string tifFilesPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "M_TIF_Files");
+
+                if (!Directory.Exists(tifFilesPath))
+                {
+                    return (false, null, $"TIFF files directory not found at: {tifFilesPath}");
+                }
+
+                if (allFilenamesByGroup == null || allFilenamesByGroup.Count == 0)
+                {
+                    return (false, null, "No groups to process");
+                }
+
+                // Process each group
+                foreach (var kvp in allFilenamesByGroup)
+                {
+                    string groupKey = kvp.Key;
+                    string[] tiffFilenames = kvp.Value;
+
+                    if (string.IsNullOrWhiteSpace(groupKey) || tiffFilenames == null || tiffFilenames.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    context?.Logger?.LogInformation($"Processing group {groupKey} with {tiffFilenames.Length} files");
+
+                    try
+                    {
+                        // Create a simple PDF without using Document constructor parameters
+                        var pdfDocument = new Document();
+
+                        // Set basic document info to avoid null reference issues
+                        pdfDocument.Info.Title = $"Merged PDF for {groupKey}";
+                        pdfDocument.Info.Author = "TiffToPdfConverter";
+                        pdfDocument.Info.Subject = $"Group {groupKey}";
+                        pdfDocument.Info.Creator = "Aspose.PDF";
+
+                        int processedFiles = 0;
+                        int maxFiles = 4; // Limit for evaluation mode
+
+                        // Process TIFF files (limit to 4 for evaluation mode)
+                        foreach (string tiffFilename in tiffFilenames.Take(maxFiles))
+                        {
+                            string actualTiffPath = FindTiffFile(tifFilesPath, tiffFilename);
+
+                            if (actualTiffPath != null && File.Exists(actualTiffPath))
+                            {
+                                try
+                                {
+                                    // Create a page
+                                    var page = pdfDocument.Pages.Add();
+
+                                    // Set page size explicitly
+                                    page.SetPageSize(PageSize.A4.Width, PageSize.A4.Height);
+
+                                    // Create and add image
+                                    var image = new Aspose.Pdf.Image();
+                                    image.File = actualTiffPath;
+
+                                    // Set fixed dimensions (A4 size minus margins)
+                                    image.FixWidth = 523;  // A4 width (595) - 72pt margins
+                                    image.FixHeight = 770; // A4 height (842) - 72pt margins
+
+                                    // Add image to page
+                                    page.Paragraphs.Add(image);
+                                    processedFiles++;
+
+                                    context?.Logger?.LogInformation($"Added {Path.GetFileName(actualTiffPath)} to group {groupKey}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    context?.Logger?.LogWarning($"Failed to add {tiffFilename}: {ex.Message}");
+                                }
+                            }
+                        }
+
+                        if (processedFiles > 0)
+                        {
+                            // Create output path
+                            string outputDir = Path.Combine(Path.GetTempPath(), "OUTPUT");
+                            Directory.CreateDirectory(outputDir);
+                            string outputPath = Path.Combine(outputDir, $"{groupKey}_Merged.pdf");
+
+                            try
+                            {
+                                context?.Logger?.LogInformation($"Saving PDF to: {outputPath}");
+
+                                // Use SaveOptions to avoid potential issues
+                                var saveOptions = new Aspose.Pdf.PdfSaveOptions();
+                                pdfDocument.Save(outputPath, saveOptions);
+
+                                if (File.Exists(outputPath))
+                                {
+                                    var fileInfo = new FileInfo(outputPath);
+                                    createdPdfs[groupKey] = $"Path: {outputPath}, Size: {fileInfo.Length} bytes, Pages: {processedFiles}";
+                                    context?.Logger?.LogInformation($"Successfully saved PDF for group {groupKey}");
+                                }
+                            }
+                            catch (Exception saveEx)
+                            {
+                                context?.Logger?.LogError($"Save failed for {groupKey}: {saveEx.Message}");
+
+                                // Try minimal save
+                                try
+                                {
+                                    var minimalDoc = new Document();
+                                    var page = minimalDoc.Pages.Add();
+                                    page.Paragraphs.Add(new TextFragment($"Group {groupKey} - {processedFiles} files processed"));
+
+                                    string fallbackPath = Path.Combine(Path.GetTempPath(), $"{groupKey}_fallback.pdf");
+                                    minimalDoc.Save(fallbackPath);
+
+                                    if (File.Exists(fallbackPath))
+                                    {
+                                        createdPdfs[groupKey] = $"Path: {fallbackPath} (fallback)";
+                                        context?.Logger?.LogInformation($"Created fallback PDF for group {groupKey}");
+                                    }
+
+                                    minimalDoc.Dispose();
+                                }
+                                catch
+                                {
+                                    context?.Logger?.LogError($"Fallback also failed for group {groupKey}");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            context?.Logger?.LogWarning($"No files processed for group {groupKey}");
+                        }
+
+                        // Dispose document
+                        pdfDocument?.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        context?.Logger?.LogError($"Error processing group {groupKey}: {ex.Message}");
+                    }
+                }
+
+                return (createdPdfs.Count > 0, createdPdfs, createdPdfs.Count == 0 ? "No PDFs created" : null);
+            }
+            catch (Exception ex)
+            {
+                return (false, null, $"Fatal error: {ex.Message}");
             }
         }
 
@@ -457,7 +660,7 @@ namespace TiffToPdfConverter
                     client.DefaultRequestHeaders.Add("User-Agent", "TiffToPdfConverter Lambda");
 
                     var response = await client.GetAsync(downloadUrl);
-                    
+
                     if (response.IsSuccessStatusCode)
                     {
                         var content = await response.Content.ReadAsStringAsync();
@@ -491,13 +694,13 @@ namespace TiffToPdfConverter
                         {
                             var files = Directory.GetFiles(path);
                             var directories = Directory.GetDirectories(path);
-                            
+
                             var directoryListing = "Directory Contents:\n\nFiles:\n";
                             directoryListing += files.Length > 0 ? string.Join("\n", files.Select(f => Path.GetFileName(f))) : "No files found";
-                            
+
                             directoryListing += "\n\nDirectories:\n";
                             directoryListing += directories.Length > 0 ? string.Join("\n", directories.Select(d => Path.GetFileName(d))) : "No directories found";
-                            
+
                             return (true, directoryListing, null, directoryListing.Length);
                         }
                         catch (UnauthorizedAccessException)
@@ -537,6 +740,12 @@ namespace TiffToPdfConverter
         {
             try
             {
+                // Set Aspose license at the beginning
+                if (!SetAsposeLicense())
+                {
+                    context.Logger.LogWarning("Failed to set Aspose license - running in evaluation mode");
+                }
+
                 // Parse the request body
                 RequestBody requestBody = null;
                 if (!string.IsNullOrEmpty(apigProxyEvent.Body))
@@ -549,7 +758,8 @@ namespace TiffToPdfConverter
                     var location = await GetCallingIP();
                     return new APIGatewayProxyResponse
                     {
-                        Body = JsonSerializer.Serialize(new { 
+                        Body = JsonSerializer.Serialize(new
+                        {
                             pdfCreation = new { success = false, error = "Request body must contain a 'path' field" },
                             metadata = new { errorType = "InvalidRequest" },
                             location = location
@@ -565,60 +775,128 @@ namespace TiffToPdfConverter
                 if (requestBody.path.Equals("Start", StringComparison.OrdinalIgnoreCase))
                 {
                     context.Logger.LogInformation("Processing 'Start' request - reading local index file");
-                    
+
                     var parseResult = await ReadAndParseIndexFile(context);
-                    
+
                     if (parseResult.success)
                     {
                         var location = await GetCallingIP();
-                        
+
                         // Extract pdfCreation and metadata from the parsed result
                         dynamic indexData = parseResult.jsonData;
-                        
-                        // Log grouped information directly from the allFilenamesByBatchNumberAnditem_number data
+
+                        // FIX: Use JsonSerializer for safe type handling with explicit JsonElement types
                         try
                         {
-                            var allFilenamesData = indexData.allFilenamesByBatchNumberAnditem_number as Dictionary<string, string[]>;
-                            var groupedData = indexData.groupedByBatchNumberAnditem_number as Dictionary<string, dynamic>;
-                            
-                            if (allFilenamesData != null && groupedData != null)
+                            // Serialize the dynamic object to JSON string
+                            var jsonString = JsonSerializer.Serialize(indexData);
+                            var jsonDoc = JsonDocument.Parse(jsonString);
+                            var root = jsonDoc.RootElement;
+
+                            // Log grouped information safely using JsonDocument
+                            // FIX: Explicitly declare JsonElement type for out parameters
+                            JsonElement allFilenamesElement = default;
+                            JsonElement groupedElement = default;
+
+                            if (root.TryGetProperty("allFilenamesByBatchNumberAnditem_number", out allFilenamesElement) &&
+                                root.TryGetProperty("groupedByBatchNumberAnditem_number", out groupedElement))
                             {
-                                foreach (var group in allFilenamesData)
+                                if (allFilenamesElement.ValueKind == JsonValueKind.Object)
                                 {
-                                    var key = group.Key;
-                                    var allFiles = group.Value ?? Array.Empty<string>();
-                                    
-                                    // Get C and M file counts from the original grouped data
-                                    var cFilenames = Array.Empty<string>();
-                                    var mFilenames = Array.Empty<string>();
-                                    
-                                    if (groupedData.ContainsKey(key))
+                                    foreach (var group in allFilenamesElement.EnumerateObject())
                                     {
-                                        var groupValue = groupedData[key];
-                                        cFilenames = groupValue?.cFilenames as string[] ?? Array.Empty<string>();
-                                        mFilenames = groupValue?.mFilenames as string[] ?? Array.Empty<string>();
+                                        var key = group.Name;
+                                        var filesArray = group.Value;
+
+                                        if (filesArray.ValueKind == JsonValueKind.Array)
+                                        {
+                                            var filesList = new List<string>();
+                                            foreach (var file in filesArray.EnumerateArray())
+                                            {
+                                                var fileName = file.GetString();
+                                                if (!string.IsNullOrEmpty(fileName))
+                                                {
+                                                    filesList.Add(fileName);
+                                                }
+                                            }
+
+                                            // Get C and M file counts
+                                            int cFileCount = 0;
+                                            int mFileCount = 0;
+
+                                            JsonElement groupData;
+                                            if (groupedElement.ValueKind == JsonValueKind.Object &&
+                                                groupedElement.TryGetProperty(key, out groupData))
+                                            {
+                                                JsonElement cFiles;
+                                                JsonElement mFiles;
+
+                                                if (groupData.TryGetProperty("cFilenames", out cFiles) &&
+                                                    cFiles.ValueKind == JsonValueKind.Array)
+                                                {
+                                                    cFileCount = cFiles.GetArrayLength();
+                                                }
+
+                                                if (groupData.TryGetProperty("mFilenames", out mFiles) &&
+                                                    mFiles.ValueKind == JsonValueKind.Array)
+                                                {
+                                                    mFileCount = mFiles.GetArrayLength();
+                                                }
+                                            }
+
+                                            var fileListStr = string.Join(", ", filesList);
+                                            context.Logger.LogInformation($"Group {key}: [{fileListStr}] (C files: {cFileCount}, M files: {mFileCount})");
+                                        }
                                     }
-                                    
-                                    var fileList = string.Join(", ", allFiles);
-                                    context.Logger.LogInformation($"Group {key}: [{fileList}] (C files: {cFilenames.Length}, M files: {mFilenames.Length})");
                                 }
                             }
                             else
                             {
-                                context.Logger.LogWarning("Failed to cast grouped data to expected types for logging");
+                                context.Logger.LogWarning("Could not find expected properties in index data for logging");
                             }
                         }
                         catch (Exception logEx)
                         {
-                            context.Logger.LogWarning($"Failed to log grouped info: {logEx.Message}");
+                            // If logging fails, just log a simple warning and continue
+                            context.Logger.LogWarning($"Could not log detailed grouped data: {logEx.Message}");
                         }
-                        
-                        var body = new Dictionary<string, object>
+
+                        // Extract the response data safely
+                        var body = new Dictionary<string, object>();
+
+                        try
                         {
-                            { "pdfCreation", indexData.pdfCreation },
-                            { "metadata", indexData.metadata },
-                            { "location", location }
-                        };
+                            // Serialize and deserialize to safely extract properties
+                            var jsonString = JsonSerializer.Serialize(indexData);
+                            var jsonDoc = JsonDocument.Parse(jsonString);
+                            var root = jsonDoc.RootElement;
+
+                            // FIX: Explicitly declare JsonElement type for out parameters
+                            JsonElement pdfCreationElement;
+                            JsonElement metadataElement;
+
+                            if (root.TryGetProperty("pdfCreation", out pdfCreationElement))
+                            {
+                                body["pdfCreation"] = JsonSerializer.Deserialize<object>(pdfCreationElement.GetRawText());
+                            }
+
+                            if (root.TryGetProperty("metadata", out metadataElement))
+                            {
+                                body["metadata"] = JsonSerializer.Deserialize<object>(metadataElement.GetRawText());
+                            }
+
+                            body["location"] = location;
+                        }
+                        catch
+                        {
+                            // Fallback to direct assignment if parsing fails
+                            body = new Dictionary<string, object>
+                    {
+                        { "pdfCreation", indexData.pdfCreation },
+                        { "metadata", indexData.metadata },
+                        { "location", location }
+                    };
+                        }
 
                         context.Logger.LogInformation("Successfully parsed local index file");
 
@@ -636,7 +914,8 @@ namespace TiffToPdfConverter
                         var location = await GetCallingIP();
                         return new APIGatewayProxyResponse
                         {
-                            Body = JsonSerializer.Serialize(new { 
+                            Body = JsonSerializer.Serialize(new
+                            {
                                 pdfCreation = new { success = false, error = "Failed to read index file", details = parseResult.error },
                                 metadata = new { errorType = "IndexFileParseError", path = requestBody.path },
                                 location = location
@@ -654,16 +933,16 @@ namespace TiffToPdfConverter
                 {
                     var location = await GetCallingIP();
                     var body = new Dictionary<string, object>
-                    {
-                        { "pdfCreation", new { success = false, message = "No PDF creation performed - file downloaded only" } },
-                        { "metadata", new { 
-                            filePath = requestBody.path,
-                            fileSize = downloadResult.size,
-                            downloadedAt = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss UTC"),
-                            contentLength = downloadResult.content?.Length ?? 0
-                        } },
-                        { "location", location }
-                    };
+            {
+                { "pdfCreation", new { success = false, message = "No PDF creation performed - file downloaded only" } },
+                { "metadata", new {
+                    filePath = requestBody.path,
+                    fileSize = downloadResult.size,
+                    downloadedAt = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss UTC"),
+                    contentLength = downloadResult.content?.Length ?? 0
+                } },
+                { "location", location }
+            };
 
                     context.Logger.LogInformation($"Successfully downloaded index file: {downloadResult.size} bytes");
 
@@ -681,7 +960,8 @@ namespace TiffToPdfConverter
                     var location = await GetCallingIP();
                     return new APIGatewayProxyResponse
                     {
-                        Body = JsonSerializer.Serialize(new { 
+                        Body = JsonSerializer.Serialize(new
+                        {
                             pdfCreation = new { success = false, error = "Failed to download index file", details = downloadResult.error },
                             metadata = new { errorType = "IndexFileDownloadError", path = requestBody.path },
                             location = location
@@ -696,7 +976,8 @@ namespace TiffToPdfConverter
                 var location = await GetCallingIP();
                 return new APIGatewayProxyResponse
                 {
-                    Body = JsonSerializer.Serialize(new { 
+                    Body = JsonSerializer.Serialize(new
+                    {
                         pdfCreation = new { success = false, error = "Invalid JSON in request body" },
                         metadata = new { errorType = "JsonParseError" },
                         location = location
@@ -711,7 +992,8 @@ namespace TiffToPdfConverter
                 var location = await GetCallingIP();
                 return new APIGatewayProxyResponse
                 {
-                    Body = JsonSerializer.Serialize(new { 
+                    Body = JsonSerializer.Serialize(new
+                    {
                         pdfCreation = new { success = false, error = "Internal server error", details = ex.Message },
                         metadata = new { errorType = "InternalServerError" },
                         location = location
