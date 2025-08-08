@@ -12,6 +12,9 @@ using Amazon.Lambda.APIGatewayEvents;
 using Aspose.Pdf;
 using Aspose.Pdf.Devices;
 using Aspose.Pdf.Text;
+using IOPath = System.IO.Path;
+using Amazon.S3;
+using Amazon.S3.Model;
 
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
@@ -40,7 +43,7 @@ namespace TiffToPdfConverter
                 // Default license file path if not provided
                 if (string.IsNullOrEmpty(licenseFilePath))
                 {
-                    licenseFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Aspose.Total.lic");
+                    licenseFilePath = IOPath.Combine(AppDomain.CurrentDomain.BaseDirectory, "Aspose.Total.lic");
                 }
 
                 // Check if license file exists
@@ -48,11 +51,11 @@ namespace TiffToPdfConverter
                 {
                     // Try alternative common license file names
                     string[] alternativeNames = { "Aspose.PDF.lic", "license.lic", "Aspose.lic" };
-                    string baseDirectory = Path.GetDirectoryName(licenseFilePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+            string baseDirectory = IOPath.GetDirectoryName(licenseFilePath) ?? AppDomain.CurrentDomain.BaseDirectory;
                     
                     foreach (string altName in alternativeNames)
                     {
-                        string altPath = Path.Combine(baseDirectory, altName);
+                        string altPath = IOPath.Combine(baseDirectory, altName);
                         if (File.Exists(altPath))
                         {
                             licenseFilePath = altPath;
@@ -137,7 +140,7 @@ namespace TiffToPdfConverter
             try
             {
                 // Look for index file inside the INDEX_FILE directory
-                string indexDirectoryPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, INDEX_FILE);
+                string indexDirectoryPath = IOPath.Combine(AppDomain.CurrentDomain.BaseDirectory, INDEX_FILE);
 
                 if (!Directory.Exists(indexDirectoryPath))
                 {
@@ -150,7 +153,7 @@ namespace TiffToPdfConverter
 
                 foreach (string fileName in possibleIndexFiles)
                 {
-                    string testPath = Path.Combine(indexDirectoryPath, fileName);
+                    string testPath = IOPath.Combine(indexDirectoryPath, fileName);
                     if (File.Exists(testPath))
                     {
                         indexFilePath = testPath;
@@ -161,7 +164,7 @@ namespace TiffToPdfConverter
                 if (indexFilePath == null)
                 {
                     var availableFiles = Directory.GetFiles(indexDirectoryPath);
-                    return (false, null, $"No index file found in directory: {indexDirectoryPath}. Available files: {string.Join(", ", availableFiles.Select(Path.GetFileName))}");
+                    return (false, null, $"No index file found in directory: {indexDirectoryPath}. Available files: {string.Join(", ", availableFiles.Select(IOPath.GetFileName))}");
                 }
 
                 var content = await File.ReadAllTextAsync(indexFilePath);
@@ -278,7 +281,7 @@ namespace TiffToPdfConverter
                     metadata = new
                     {
                         filePath = indexFilePath,
-                        fileName = Path.GetFileName(indexFilePath),
+                        fileName = IOPath.GetFileName(indexFilePath),
                         directory = indexDirectoryPath,
                         fileSize = content.Length,
                         parsedAt = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss UTC")
@@ -308,7 +311,7 @@ namespace TiffToPdfConverter
                 context?.Logger?.LogInformation("Starting PDF creation process");
 
                 var createdPdfs = new Dictionary<string, string>();
-                string tifFilesPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "M_TIF_Files");
+                string tifFilesPath = IOPath.Combine(AppDomain.CurrentDomain.BaseDirectory, "M_TIF_Files");
 
                 if (!Directory.Exists(tifFilesPath))
                 {
@@ -378,12 +381,12 @@ namespace TiffToPdfConverter
                                     page.Paragraphs.Add(image);
                                     processedFiles++;
 
-                                    context?.Logger?.LogInformation($"Added {Path.GetFileName(actualTiffPath)} to group {groupKey}");
+                                    context?.Logger?.LogInformation($"Added {IOPath.GetFileName(actualTiffPath)} to group {groupKey}");
                                 }
                                 catch (Exception ex)
                                 {
                                     // Log error but continue processing other files
-                                    context?.Logger?.LogInformation($"Warning: Failed to process {Path.GetFileName(actualTiffPath)}: {ex.Message}");
+                        context?.Logger?.LogInformation($"Warning: Failed to process {IOPath.GetFileName(actualTiffPath)}: {ex.Message}");
                                 }
                             }
                             else
@@ -405,12 +408,12 @@ namespace TiffToPdfConverter
 
                         // Save the merged PDF to temp directory
                         string outputFileName = $"{groupKey}_Merged.pdf";
-                        string outputDir = Path.Combine(Path.GetTempPath(), "OUTPUT");
+            string outputDir = IOPath.Combine(IOPath.GetTempPath(), "OUTPUT");
 
                         // Ensure OUTPUT directory exists
                         Directory.CreateDirectory(outputDir);
 
-                        string outputPath = Path.Combine(outputDir, outputFileName);
+            string outputPath = IOPath.Combine(outputDir, outputFileName);
 
                         // Save the PDF
                         pdfDocument.Save(outputPath);
@@ -452,7 +455,12 @@ namespace TiffToPdfConverter
                 context?.Logger?.LogInformation("Starting PDF creation process");
 
                 var createdPdfs = new Dictionary<string, string>();
-                string tifFilesPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "M_TIF_Files");
+                string tifFilesPath = IOPath.Combine(AppDomain.CurrentDomain.BaseDirectory, "M_TIF_Files");
+                string bucketName = Environment.GetEnvironmentVariable("OUTPUT_BUCKET");
+                string keyPrefix = Environment.GetEnvironmentVariable("OUTPUT_PREFIX") ?? string.Empty;
+                string normalizedPrefix = string.Join("/",
+                    (keyPrefix ?? string.Empty)
+                        .Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries));
 
                 if (!Directory.Exists(tifFilesPath))
                 {
@@ -463,6 +471,13 @@ namespace TiffToPdfConverter
                 {
                     return (false, null, "No groups to process");
                 }
+
+                if (string.IsNullOrWhiteSpace(bucketName))
+                {
+                    return (false, null, "Missing OUTPUT_BUCKET environment variable");
+                }
+
+                using var s3Client = new AmazonS3Client();
 
                 // Process each group
                 foreach (var kvp in allFilenamesByGroup)
@@ -506,19 +521,16 @@ namespace TiffToPdfConverter
                                     // Set page size explicitly
                                     page.SetPageSize(PageSize.A4.Width, PageSize.A4.Height);
 
-                                    // Create and add image
+                                    // Create and add image sized to the content area (A4 minus 36pt margins)
                                     var image = new Aspose.Pdf.Image();
                                     image.File = actualTiffPath;
+                                    image.FixWidth = 523d;  // A4 width (595) - 72pt margins
+                                    image.FixHeight = 770d; // A4 height (842) - 72pt margins
 
-                                    // Set fixed dimensions (A4 size minus margins)
-                                    image.FixWidth = 523;  // A4 width (595) - 72pt margins
-                                    image.FixHeight = 770; // A4 height (842) - 72pt margins
-
-                                    // Add image to page
                                     page.Paragraphs.Add(image);
                                     processedFiles++;
 
-                                    context?.Logger?.LogInformation($"Added {Path.GetFileName(actualTiffPath)} to group {groupKey}");
+                                    context?.Logger?.LogInformation($"Added {IOPath.GetFileName(actualTiffPath)} to group {groupKey}");
                                 }
                                 catch (Exception ex)
                                 {
@@ -529,53 +541,36 @@ namespace TiffToPdfConverter
 
                         if (processedFiles > 0)
                         {
-                            // Create output path
-                            string outputDir = Path.Combine(Path.GetTempPath(), "OUTPUT");
-                            Directory.CreateDirectory(outputDir);
-                            string outputPath = Path.Combine(outputDir, $"{groupKey}_Merged.pdf");
+                            // Save to memory stream, then upload to S3
+                            using var pdfStream = new MemoryStream();
+                            var saveOptions = new Aspose.Pdf.PdfSaveOptions();
+                            pdfDocument.Save(pdfStream, saveOptions);
+                            pdfStream.Position = 0;
 
-                            try
+                            string objectKey = string.IsNullOrEmpty(normalizedPrefix)
+                                ? $"{groupKey}_Merged.pdf"
+                                : $"{normalizedPrefix}/{groupKey}_Merged.pdf";
+
+                            if (string.IsNullOrWhiteSpace(bucketName) || string.IsNullOrWhiteSpace(objectKey))
                             {
-                                context?.Logger?.LogInformation($"Saving PDF to: {outputPath}");
-
-                                // Use SaveOptions to avoid potential issues
-                                var saveOptions = new Aspose.Pdf.PdfSaveOptions();
-                                pdfDocument.Save(outputPath, saveOptions);
-
-                                if (File.Exists(outputPath))
-                                {
-                                    var fileInfo = new FileInfo(outputPath);
-                                    createdPdfs[groupKey] = $"Path: {outputPath}, Size: {fileInfo.Length} bytes, Pages: {processedFiles}";
-                                    context?.Logger?.LogInformation($"Successfully saved PDF for group {groupKey}");
-                                }
+                                throw new InvalidOperationException($"Invalid S3 target (bucket='{bucketName}', key='{objectKey ?? "<null>"}'). Check OUTPUT_BUCKET/OUTPUT_PREFIX.");
                             }
-                            catch (Exception saveEx)
+
+                            context?.Logger?.LogInformation($"Uploading to s3://{bucketName}/{objectKey}");
+
+                            var putRequest = new PutObjectRequest
                             {
-                                context?.Logger?.LogError($"Save failed for {groupKey}: {saveEx.Message}");
+                                BucketName = bucketName,
+                                Key = objectKey,
+                                InputStream = pdfStream,
+                                ContentType = "application/pdf",
+                                ServerSideEncryptionMethod = ServerSideEncryptionMethod.AES256
+                            };
 
-                                // Try minimal save
-                                try
-                                {
-                                    var minimalDoc = new Document();
-                                    var page = minimalDoc.Pages.Add();
-                                    page.Paragraphs.Add(new TextFragment($"Group {groupKey} - {processedFiles} files processed"));
+                            var putResponse = s3Client.PutObjectAsync(putRequest).GetAwaiter().GetResult();
 
-                                    string fallbackPath = Path.Combine(Path.GetTempPath(), $"{groupKey}_fallback.pdf");
-                                    minimalDoc.Save(fallbackPath);
-
-                                    if (File.Exists(fallbackPath))
-                                    {
-                                        createdPdfs[groupKey] = $"Path: {fallbackPath} (fallback)";
-                                        context?.Logger?.LogInformation($"Created fallback PDF for group {groupKey}");
-                                    }
-
-                                    minimalDoc.Dispose();
-                                }
-                                catch
-                                {
-                                    context?.Logger?.LogError($"Fallback also failed for group {groupKey}");
-                                }
-                            }
+                            createdPdfs[groupKey] = $"s3://{bucketName}/{objectKey}";
+                            context?.Logger?.LogInformation($"Uploaded PDF for group {groupKey} to s3://{bucketName}/{objectKey}");
                         }
                         else
                         {
@@ -602,28 +597,28 @@ namespace TiffToPdfConverter
         private static string FindTiffFile(string basePath, string filename)
         {
             // First try the exact filename as provided
-            string fullPath = Path.Combine(basePath, filename);
+                string fullPath = IOPath.Combine(basePath, filename);
             if (File.Exists(fullPath))
                 return fullPath;
 
             // Get filename without extension to try different variations
-            string nameWithoutExt = Path.GetFileNameWithoutExtension(filename);
+            string nameWithoutExt = IOPath.GetFileNameWithoutExtension(filename);
             string[] tiffExtensions = { ".tiff", ".tif", ".TIFF", ".TIF" };
 
             // Try each TIFF extension
             foreach (string extension in tiffExtensions)
             {
-                string testPath = Path.Combine(basePath, nameWithoutExt + extension);
+                string testPath = IOPath.Combine(basePath, nameWithoutExt + extension);
                 if (File.Exists(testPath))
                     return testPath;
             }
 
             // If original filename had no extension, try adding TIFF extensions
-            if (string.IsNullOrEmpty(Path.GetExtension(filename)))
+            if (string.IsNullOrEmpty(IOPath.GetExtension(filename)))
             {
                 foreach (string extension in tiffExtensions)
                 {
-                    string testPath = Path.Combine(basePath, filename + extension);
+                    string testPath = IOPath.Combine(basePath, filename + extension);
                     if (File.Exists(testPath))
                         return testPath;
                 }
@@ -638,7 +633,7 @@ namespace TiffToPdfConverter
             if (string.IsNullOrEmpty(filePath))
                 return false;
 
-            string extension = Path.GetExtension(filePath).ToLowerInvariant();
+            string extension = IOPath.GetExtension(filePath).ToLowerInvariant();
             return extension == ".tiff" || extension == ".tif";
         }
 
@@ -651,7 +646,7 @@ namespace TiffToPdfConverter
                 {
                     // Handle web URL
                     string downloadUrl = path;
-                    if (!path.Contains("index") && !Path.HasExtension(path))
+                    if (!path.Contains("index") && !IOPath.HasExtension(path))
                     {
                         downloadUrl = path.TrimEnd('/') + "/index";
                     }
@@ -676,9 +671,9 @@ namespace TiffToPdfConverter
                 {
                     // Handle local file path
                     string filePath = path;
-                    if (!path.Contains("index") && !Path.HasExtension(path))
+                    if (!path.Contains("index") && !IOPath.HasExtension(path))
                     {
-                        filePath = Path.Combine(path, "index");
+                        filePath = IOPath.Combine(path, "index");
                     }
 
                     if (File.Exists(filePath))
@@ -687,7 +682,7 @@ namespace TiffToPdfConverter
                         var size = content.Length;
                         return (true, content, null, size);
                     }
-                    else if (Directory.Exists(path) && !Path.HasExtension(path) && !path.Contains("index"))
+                    else if (Directory.Exists(path) && !IOPath.HasExtension(path) && !path.Contains("index"))
                     {
                         // If it's a directory and no specific file was requested, list directory contents
                         try
@@ -696,10 +691,10 @@ namespace TiffToPdfConverter
                             var directories = Directory.GetDirectories(path);
 
                             var directoryListing = "Directory Contents:\n\nFiles:\n";
-                            directoryListing += files.Length > 0 ? string.Join("\n", files.Select(f => Path.GetFileName(f))) : "No files found";
+                            directoryListing += files.Length > 0 ? string.Join("\n", files.Select(f => IOPath.GetFileName(f))) : "No files found";
 
                             directoryListing += "\n\nDirectories:\n";
-                            directoryListing += directories.Length > 0 ? string.Join("\n", directories.Select(d => Path.GetFileName(d))) : "No directories found";
+                            directoryListing += directories.Length > 0 ? string.Join("\n", directories.Select(d => IOPath.GetFileName(d))) : "No directories found";
 
                             return (true, directoryListing, null, directoryListing.Length);
                         }

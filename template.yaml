@@ -6,31 +6,65 @@ Description: >
 # More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
   Function:
-    Timeout: 10
+    Timeout: 900
     MemorySize: 128
 
     Tracing: Active
   Api:
     TracingEnabled: true
 Resources:
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
   TiffToPdfConverterFunction:
     Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
     Properties:
       CodeUri: ./src/TiffToPdfConverter/
       Handler: TiffToPdfConverter::TiffToPdfConverter.Function::FunctionHandler
-      Runtime: dotnet6
+      Runtime: dotnet8
       Architectures:
       - x86_64
       MemorySize: 256
-      Environment: # More info about Env Vars: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#environment-object
+      Environment:
         Variables:
-          PARAM1: VALUE
+          OUTPUT_BUCKET: !Ref OutputBucket
+          OUTPUT_PREFIX: pdf
       Events:
         ProcessCsv:
           Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
           Properties:
             Path: /processcsv
             Method: put
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: AllowPutObjectsToOutputBucket
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+              Resource: !Sub '${OutputBucket.Arn}/pdf/*'
+            - Sid: AllowBucketListForPrefixValidation
+              Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt OutputBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - 'pdf/*'
 
   ApplicationResourceGroup:
     Type: AWS::ResourceGroups::Group
@@ -58,3 +92,6 @@ Outputs:
   TiffToPdfConverterFunctionIamRole:
     Description: Implicit IAM Role created for TIFF to PDF Converter function
     Value: !GetAtt TiffToPdfConverterFunctionRole.Arn
+  OutputBucketName:
+    Description: S3 bucket name where merged PDFs are uploaded
+    Value: !Ref OutputBucket
