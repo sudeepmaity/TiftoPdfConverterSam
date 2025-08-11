@@ -8,11 +8,47 @@ Globals:
   Function:
     Timeout: 900
     MemorySize: 128
-
     Tracing: Active
   Api:
     TracingEnabled: true
+
 Resources:
+  # SQS Queue for unzip completion notifications
+  UnzipNotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-unzip-notifications'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 960
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      KmsMasterKeyId: alias/aws/sqs  # Server-side encryption
+
+  # Dead Letter Queue for failed messages
+  UnzipNotificationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-unzip-notifications-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  # Source bucket for zip files and extracted content
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  # Output bucket for processed PDFs
   OutputBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -28,28 +64,86 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerPreferred
-  TiffToPdfConverterFunction:
-    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+
+  # Lambda function for extracting zip files
+  ZipExtractorFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      CodeUri: ./src/TiffToPdfConverter/
-      Handler: TiffToPdfConverter::TiffToPdfConverter.Function::FunctionHandler
+      CodeUri: ./src/ZipExtractorFunction/
+      Handler: ZipExtractorFunction::ZipExtractorFunction.Function::FunctionHandler
       Runtime: dotnet8
       Architectures:
-      - x86_64
-      MemorySize: 256
+        - x86_64
+      MemorySize: 512
+      Timeout: 300
       Environment:
         Variables:
-          OUTPUT_BUCKET: !Ref OutputBucket
-          OUTPUT_PREFIX: pdf
+          NOTIFICATION_QUEUE_URL: !Ref UnzipNotificationQueue
       Events:
-        ProcessCsv:
-          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+        S3Event:
+          Type: S3
           Properties:
-            Path: /processcsv
-            Method: put
+            Bucket: !Ref SourceBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: zip/
+                  - Name: suffix
+                    Value: .zip
       Policies:
         - Version: '2012-10-17'
           Statement:
+            - Sid: AllowS3ReadWriteOnAnyBucket
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:ListBucket
+              Resource: '*'
+            - Sid: AllowSQSSendMessage
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt UnzipNotificationQueue.Arn
+
+  # TiffToPdfConverter function with explicit bucket references
+  TiffToPdfConverterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/TiffToPdfConverter/
+      Handler: TiffToPdfConverter::TiffToPdfConverter.Function::SqsFunctionHandler
+      Runtime: dotnet8
+      Architectures:
+        - x86_64
+      MemorySize: 256
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+          OUTPUT_PREFIX: pdf
+          NOTIFICATION_QUEUE_URL: !Ref UnzipNotificationQueue
+      Events:
+        SqsQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt UnzipNotificationQueue.Arn
+            BatchSize: 1
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: AllowReadFromSourceBucket
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:GetObjectMetadata
+                - s3:ListBucket
+              Resource:
+                - !Sub '${SourceBucket.Arn}'
+                - !Sub '${SourceBucket.Arn}/*'
             - Sid: AllowPutObjectsToOutputBucket
               Effect: Allow
               Action:
@@ -65,6 +159,13 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - 'pdf/*'
+            - Sid: AllowSQSReceiveMessage
+              Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt UnzipNotificationQueue.Arn
 
   ApplicationResourceGroup:
     Type: AWS::ResourceGroups::Group
@@ -73,25 +174,33 @@ Resources:
         Fn::Sub: ApplicationInsights-SAM-${AWS::StackName}
       ResourceQuery:
         Type: CLOUDFORMATION_STACK_1_0
+
   ApplicationInsightsMonitoring:
     Type: AWS::ApplicationInsights::Application
     Properties:
       ResourceGroupName:
         Ref: ApplicationResourceGroup
       AutoConfigurationEnabled: 'true'
+
 Outputs:
-  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
-  # Find out more about other implicit resources you can reference within SAM
-  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
-  TiffToPdfConverterApi:
-    Description: API Gateway endpoint URL for Prod stage for TIFF to PDF Converter function
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/processcsv/"
   TiffToPdfConverterFunction:
     Description: TIFF to PDF Converter Lambda Function ARN
     Value: !GetAtt TiffToPdfConverterFunction.Arn
   TiffToPdfConverterFunctionIamRole:
     Description: Implicit IAM Role created for TIFF to PDF Converter function
     Value: !GetAtt TiffToPdfConverterFunctionRole.Arn
+  SourceBucketName:
+    Description: S3 bucket name for zip files and extracted content
+    Value: !Ref SourceBucket
   OutputBucketName:
     Description: S3 bucket name where merged PDFs are uploaded
     Value: !Ref OutputBucket
+  ZipExtractorFunction:
+    Description: Zip Extractor Lambda Function ARN
+    Value: !GetAtt ZipExtractorFunction.Arn
+  UnzipNotificationQueueUrl:
+    Description: SQS Queue URL for unzip completion notifications
+    Value: !Ref UnzipNotificationQueue
+  UnzipNotificationQueueArn:
+    Description: SQS Queue ARN for unzip completion notifications
+    Value: !GetAtt UnzipNotificationQueue.Arn

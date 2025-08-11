@@ -9,6 +9,7 @@ using System;
 
 using Amazon.Lambda.Core;
 using Amazon.Lambda.APIGatewayEvents;
+using Amazon.Lambda.SQSEvents;
 using Aspose.Pdf;
 using Aspose.Pdf.Devices;
 using Aspose.Pdf.Text;
@@ -26,10 +27,33 @@ namespace TiffToPdfConverter
         public string path { get; set; }
     }
 
+    public class UnzipNotification
+    {
+        public string SourceBucket { get; set; } = string.Empty;
+        public string SourceZipFile { get; set; } = string.Empty;
+        public bool Success { get; set; }
+        public string ExtractedToFolder { get; set; } = string.Empty;
+        public int ExtractedFilesCount { get; set; }
+        public string ErrorMessage { get; set; } = string.Empty;
+        public DateTime ProcessedAt { get; set; }
+        public string RequestId { get; set; } = string.Empty;
+    }
+
     public class Function
     {
         private const string INDEX_FILE = "INDEX_FILE"; // Directory containing the index file
         private static readonly HttpClient client = new HttpClient();
+        private readonly IAmazonS3 _s3Client;
+
+        public Function()
+        {
+            _s3Client = new AmazonS3Client();
+        }
+
+        public Function(IAmazonS3 s3Client)
+        {
+            _s3Client = s3Client;
+        }
 
         /// <summary>
         /// Sets the Aspose.PDF license from a license file.
@@ -133,6 +157,176 @@ namespace TiffToPdfConverter
             fields.Add(currentField.ToString());
 
             return fields.ToArray();
+        }
+
+        private async Task<(bool success, object jsonData, string error)> ReadAndParseIndexFileFromS3(string bucketName, string indexKey, ILambdaContext context = null)
+        {
+            try
+            {
+                context?.Logger?.LogInformation($"Reading index file from s3://{bucketName}/{indexKey}");
+
+                // Download the index file from S3
+                var getRequest = new GetObjectRequest
+                {
+                    BucketName = bucketName,
+                    Key = indexKey
+                };
+
+                string content;
+                using (var response = await _s3Client.GetObjectAsync(getRequest))
+                using (var reader = new StreamReader(response.ResponseStream))
+                {
+                    content = await reader.ReadToEndAsync();
+                }
+
+                context?.Logger?.LogInformation($"Successfully read index file, size: {content.Length} bytes");
+
+                // Parse the content using the same logic as the local file method
+                var parseResult = await ParseIndexContent(content, bucketName, indexKey, context);
+                return (parseResult.success, parseResult.jsonData, parseResult.error);
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return (false, null, $"Index file not found at s3://{bucketName}/{indexKey}");
+            }
+            catch (AmazonS3Exception ex)
+            {
+                return (false, null, $"S3 error reading index file: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return (false, null, $"Error reading index file from S3: {ex.Message}");
+            }
+        }
+
+        private async Task<(bool success, object jsonData, string error)> ParseIndexContent(string content, string sourceBucket, string indexKey, ILambdaContext context = null)
+        {
+            try
+            {
+                // Parse the content - assuming it's CSV-like data
+                var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                  .Select(line => line.Trim())
+                                  .Where(line => !string.IsNullOrEmpty(line))
+                                  .ToList();
+
+                // Parse all entries first (same logic as original method)
+                var parsedEntries = lines.Select((line, index) =>
+                {
+                    var fields = ParseCsvLine(line);
+
+                    return new
+                    {
+                        lineNumber = index + 1,
+                        rawContent = line,
+                        fields = fields,
+                        fieldCount = fields.Length,
+                        parsedData = fields.Length >= 5 ? new
+                        {
+                            date1 = fields.Length > 0 ? fields[0]?.Trim() : null,
+                            date2 = fields.Length > 1 ? fields[1]?.Trim() : null,
+                            id1 = fields.Length > 2 ? fields[2]?.Trim() : null,
+                            lockbox = fields.Length > 3 ? fields[3]?.Trim() : null,
+                            batch_number = fields.Length > 4 ? fields[4]?.Trim() : null,
+                            item_number = fields.Length > 5 ? fields[5]?.Trim() : null,
+                            page_number = fields.Length > 6 ? fields[6]?.Trim() : null,
+                            payment_type = fields.Length > 7 ? fields[7]?.Trim() : null,
+                            file_name = fields.Length > 8 ? fields[8]?.Trim() : null,
+                            amount = fields.Length > 9 ? fields[9]?.Trim() : null,
+                            account_number_1 = fields.Length > 10 ? fields[10]?.Trim() : null,
+                            account_number_2 = fields.Length > 11 ? fields[11]?.Trim() : null,
+                            account_number_3 = fields.Length > 12 ? fields[12]?.Trim() : null,
+                            sequence_1 = fields.Length > 13 ? fields[13]?.Trim() : null,
+                            sequence_2 = fields.Length > 14 ? fields[14]?.Trim() : null,
+                            sequence_3 = fields.Length > 15 ? fields[15]?.Trim() : null,
+                            entity_name = fields.Length > 17 ? fields[17]?.Trim()?.Replace("\"", "") : null,
+                            sequence_4 = fields.Length > 19 ? fields[19]?.Trim()?.Replace("\"", "") : null
+                        } : null
+                    };
+                }).ToArray();
+
+                // Group by batch_number and item_number and collect M filenames (same logic as original)
+                var groupedByBatchNumberAnditem_number = parsedEntries
+                    .Where(entry => entry.parsedData != null &&
+                           !string.IsNullOrEmpty(entry.parsedData.batch_number) &&
+                           !string.IsNullOrEmpty(entry.parsedData.item_number))
+                    .GroupBy(entry => new { entry.parsedData.batch_number, entry.parsedData.item_number })
+                    .ToDictionary(
+                        group => $"{group.Key.batch_number}_{group.Key.item_number}",
+                        group => new
+                        {
+                            batch_number = group.Key.batch_number,
+                            item_number = group.Key.item_number,
+                            totalFiles = group.Count(),
+                            mFilenames = group
+                                .Where(entry => !string.IsNullOrWhiteSpace(entry.parsedData.payment_type) &&
+                                              entry.parsedData.payment_type.Trim().Equals("M", StringComparison.OrdinalIgnoreCase) &&
+                                              !string.IsNullOrWhiteSpace(entry.parsedData.file_name) &&
+                                              entry.parsedData.file_name.Trim().StartsWith("M", StringComparison.OrdinalIgnoreCase))
+                                .Select(entry => entry.parsedData.file_name.Trim())
+                                .ToArray(),
+                            cFilenames = group
+                                .Where(entry => !string.IsNullOrWhiteSpace(entry.parsedData.payment_type) &&
+                                              entry.parsedData.payment_type.Trim().Equals("C", StringComparison.OrdinalIgnoreCase) &&
+                                              !string.IsNullOrWhiteSpace(entry.parsedData.file_name) &&
+                                              entry.parsedData.file_name.Trim().StartsWith("C", StringComparison.OrdinalIgnoreCase))
+                                .Select(entry => entry.parsedData.file_name.Trim())
+                                .ToArray(),
+                            allEntries = group.ToArray()
+                        }
+                    );
+
+                // Create summary of ALL filenames (C and M) by batch_number and item_number for PDF creation
+                var allFilenamesByBatchNumberAnditem_number = groupedByBatchNumberAnditem_number
+                    .Where(kvp => !string.IsNullOrEmpty(kvp.Key))
+                    .ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => kvp.Value.cFilenames.Concat(kvp.Value.mFilenames).Where(f => !string.IsNullOrEmpty(f)).ToArray()
+                    );
+
+                // Keep M filenames summary for backward compatibility in response
+                var mFilenamesByBatchNumberAnditem_number = groupedByBatchNumberAnditem_number
+                    .Where(kvp => !string.IsNullOrEmpty(kvp.Key))
+                    .ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => kvp.Value.mFilenames
+                    );
+
+                // Debug: Log the allFilenamesByBatchNumberAnditem_number with actual values
+                context?.Logger?.LogInformation($"allFilenamesByBatchNumberAnditem_number: {JsonSerializer.Serialize(allFilenamesByBatchNumberAnditem_number, new JsonSerializerOptions { WriteIndented = true })}");
+
+                // Create merged PDFs from ALL TIFF files (C and M together) - now reading from S3
+                var pdfCreationResult = await CreateMergedPdfsFromS3(allFilenamesByBatchNumberAnditem_number, sourceBucket, indexKey, context);
+
+                // Convert to JSON structure with CSV parsing and grouping
+                var jsonData = new
+                {
+                    totalLines = lines.Count,
+                    allFilenamesByBatchNumberAnditem_number = allFilenamesByBatchNumberAnditem_number,
+                    mFilenamesByBatchNumberAnditem_number = mFilenamesByBatchNumberAnditem_number,
+                    groupedByBatchNumberAnditem_number = groupedByBatchNumberAnditem_number,
+                    entries = parsedEntries,
+                    pdfCreation = new
+                    {
+                        success = pdfCreationResult.success,
+                        createdPdfs = pdfCreationResult.createdPdfs,
+                        error = pdfCreationResult.error,
+                        note = "PDFs created from both C and M files combined, read from S3"
+                    },
+                    metadata = new
+                    {
+                        s3Location = $"s3://{sourceBucket}/{indexKey}",
+                        fileName = IOPath.GetFileName(indexKey),
+                        fileSize = content.Length,
+                        parsedAt = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss UTC")
+                    }
+                };
+
+                return (true, jsonData, null);
+            }
+            catch (Exception ex)
+            {
+                return (false, null, $"Error parsing index content: {ex.Message}");
+            }
         }
 
         private static async Task<(bool success, object jsonData, string error)> ReadAndParseIndexFile(ILambdaContext context = null)
@@ -448,6 +642,239 @@ namespace TiffToPdfConverter
                 return (false, null, $"Error creating merged PDFs: {ex.Message}");
             }
         }*/
+        private async Task<(bool success, Dictionary<string, string> createdPdfs, string error)> CreateMergedPdfsFromS3(Dictionary<string, string[]> allFilenamesByGroup, string sourceBucket, string indexKey, ILambdaContext context = null)
+        {
+            try
+            {
+                context?.Logger?.LogInformation("Starting S3-based PDF creation process");
+
+                var createdPdfs = new Dictionary<string, string>();
+                string bucketName = Environment.GetEnvironmentVariable("OUTPUT_BUCKET");
+                string keyPrefix = Environment.GetEnvironmentVariable("OUTPUT_PREFIX") ?? string.Empty;
+                string normalizedPrefix = string.Join("/",
+                    (keyPrefix ?? string.Empty)
+                        .Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries));
+
+                if (allFilenamesByGroup == null || allFilenamesByGroup.Count == 0)
+                {
+                    return (false, null, "No groups to process");
+                }
+
+                if (string.IsNullOrWhiteSpace(bucketName))
+                {
+                    return (false, null, "Missing OUTPUT_BUCKET environment variable");
+                }
+
+                // Extract the folder path from the index key (e.g., "unzip/test-zip/" from "unzip/test-zip/index")
+                var extractedFolder = IOPath.GetDirectoryName(indexKey)?.Replace('\\', '/');
+                if (!extractedFolder.EndsWith("/"))
+                {
+                    extractedFolder += "/";
+                }
+
+                context?.Logger?.LogInformation($"Looking for TIFF files in S3 folder: s3://{sourceBucket}/{extractedFolder}");
+
+                // Process each group
+                foreach (var kvp in allFilenamesByGroup)
+                {
+                    string groupKey = kvp.Key;
+                    string[] tiffFilenames = kvp.Value;
+
+                    if (string.IsNullOrWhiteSpace(groupKey) || tiffFilenames == null || tiffFilenames.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    context?.Logger?.LogInformation($"Processing group {groupKey} with {tiffFilenames.Length} files");
+
+                    try
+                    {
+                        // Create a simple PDF without using Document constructor parameters
+                        var pdfDocument = new Document();
+
+                        // Set basic document info to avoid null reference issues
+                        pdfDocument.Info.Title = $"Merged PDF for {groupKey}";
+                        pdfDocument.Info.Author = "TiffToPdfConverter";
+                        pdfDocument.Info.Subject = $"Group {groupKey}";
+                        pdfDocument.Info.Creator = "Aspose.PDF";
+
+                        int processedFiles = 0;
+                        int maxFiles = 4; // Limit for evaluation mode
+
+                        // Process TIFF files (limit to 4 for evaluation mode)
+                        foreach (string tiffFilename in tiffFilenames.Take(maxFiles))
+                        {
+                            try
+                            {
+                                // Find the actual TIFF file in S3
+                                string actualTiffKey = await FindTiffFileInS3(sourceBucket, extractedFolder, tiffFilename, context);
+
+                                if (actualTiffKey != null)
+                                {
+                                    context?.Logger?.LogInformation($"Found TIFF file in S3: s3://{sourceBucket}/{actualTiffKey}");
+
+                                    // Download the TIFF file from S3
+                                    var getRequest = new GetObjectRequest
+                                    {
+                                        BucketName = sourceBucket,
+                                        Key = actualTiffKey
+                                    };
+
+                                    using var response = await _s3Client.GetObjectAsync(getRequest);
+                                    using var tiffStream = new MemoryStream();
+                                    await response.ResponseStream.CopyToAsync(tiffStream);
+                                    tiffStream.Position = 0;
+
+                                    // Create a page
+                                    var page = pdfDocument.Pages.Add();
+
+                                    // Set page size explicitly
+                                    page.SetPageSize(PageSize.A4.Width, PageSize.A4.Height);
+
+                                    // Create and add image sized to the content area (A4 minus 36pt margins)
+                                    var image = new Aspose.Pdf.Image();
+                                    image.ImageStream = tiffStream;
+                                    image.FixWidth = 523d;  // A4 width (595) - 72pt margins
+                                    image.FixHeight = 770d; // A4 height (842) - 72pt margins
+
+                                    page.Paragraphs.Add(image);
+                                    processedFiles++;
+
+                                    context?.Logger?.LogInformation($"Added {tiffFilename} to group {groupKey}");
+                                }
+                                else
+                                {
+                                    context?.Logger?.LogWarning($"TIFF file not found in S3: {tiffFilename}");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                context?.Logger?.LogWarning($"Failed to add {tiffFilename}: {ex.Message}");
+                            }
+                        }
+
+                        if (processedFiles > 0)
+                        {
+                            // Save to memory stream, then upload to S3
+                            using var pdfStream = new MemoryStream();
+                            var saveOptions = new Aspose.Pdf.PdfSaveOptions();
+                            pdfDocument.Save(pdfStream, saveOptions);
+                            pdfStream.Position = 0;
+
+                            string objectKey = string.IsNullOrEmpty(normalizedPrefix)
+                                ? $"{groupKey}_Merged.pdf"
+                                : $"{normalizedPrefix}/{groupKey}_Merged.pdf";
+
+                            if (string.IsNullOrWhiteSpace(bucketName) || string.IsNullOrWhiteSpace(objectKey))
+                            {
+                                throw new InvalidOperationException($"Invalid S3 target (bucket='{bucketName}', key='{objectKey ?? "<null>"}'). Check OUTPUT_BUCKET/OUTPUT_PREFIX.");
+                            }
+
+                            context?.Logger?.LogInformation($"Uploading to s3://{bucketName}/{objectKey}");
+
+                            var putRequest = new PutObjectRequest
+                            {
+                                BucketName = bucketName,
+                                Key = objectKey,
+                                InputStream = pdfStream,
+                                ContentType = "application/pdf",
+                                ServerSideEncryptionMethod = ServerSideEncryptionMethod.AES256
+                            };
+
+                            var putResponse = await _s3Client.PutObjectAsync(putRequest);
+
+                            createdPdfs[groupKey] = $"s3://{bucketName}/{objectKey}";
+                            context?.Logger?.LogInformation($"Uploaded PDF for group {groupKey} to s3://{bucketName}/{objectKey}");
+                        }
+                        else
+                        {
+                            context?.Logger?.LogWarning($"No files processed for group {groupKey}");
+                        }
+
+                        // Dispose document
+                        pdfDocument?.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        context?.Logger?.LogError($"Error processing group {groupKey}: {ex.Message}");
+                    }
+                }
+
+                return (createdPdfs.Count > 0, createdPdfs, createdPdfs.Count == 0 ? "No PDFs created" : null);
+            }
+            catch (Exception ex)
+            {
+                return (false, null, $"Fatal error: {ex.Message}");
+            }
+        }
+
+        private async Task<string> FindTiffFileInS3(string bucketName, string folderPath, string filename, ILambdaContext context = null)
+        {
+            try
+            {
+                // Get filename without extension to try different variations
+                string nameWithoutExt = IOPath.GetFileNameWithoutExtension(filename);
+                string[] tiffExtensions = { "", ".tiff", ".tif", ".TIFF", ".TIF" };
+
+                // Try each TIFF extension
+                foreach (string extension in tiffExtensions)
+                {
+                    string testKey = folderPath + nameWithoutExt + extension;
+                    
+                    try
+                    {
+                        // Check if the object exists
+                        var headRequest = new GetObjectMetadataRequest
+                        {
+                            BucketName = bucketName,
+                            Key = testKey
+                        };
+
+                        await _s3Client.GetObjectMetadataAsync(headRequest);
+                        return testKey; // File exists, return the key
+                    }
+                    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        // File doesn't exist, try next extension
+                        continue;
+                    }
+                }
+
+                // If original filename had no extension, try adding TIFF extensions
+                if (string.IsNullOrEmpty(IOPath.GetExtension(filename)))
+                {
+                    foreach (string extension in new[] { ".tiff", ".tif", ".TIFF", ".TIF" })
+                    {
+                        string testKey = folderPath + filename + extension;
+                        
+                        try
+                        {
+                            var headRequest = new GetObjectMetadataRequest
+                            {
+                                BucketName = bucketName,
+                                Key = testKey
+                            };
+
+                            await _s3Client.GetObjectMetadataAsync(headRequest);
+                            return testKey; // File exists, return the key
+                        }
+                        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                        {
+                            // File doesn't exist, try next extension
+                            continue;
+                        }
+                    }
+                }
+
+                return null; // No file found
+            }
+            catch (Exception ex)
+            {
+                context?.Logger?.LogError($"Error searching for TIFF file {filename}: {ex.Message}");
+                return null;
+            }
+        }
+
         private static (bool success, Dictionary<string, string> createdPdfs, string error) CreateMergedPdfs(Dictionary<string, string[]> allFilenamesByGroup, ILambdaContext context = null)
         {
             try
@@ -728,6 +1155,55 @@ namespace TiffToPdfConverter
             catch (Exception ex)
             {
                 return (false, null, $"Download error: {ex.Message}", 0);
+            }
+        }
+
+        /// <summary>
+        /// SQS handler for processing unzip notifications
+        /// </summary>
+        public async Task SqsFunctionHandler(SQSEvent sqsEvent, ILambdaContext context)
+        {
+            foreach (var record in sqsEvent.Records)
+            {
+                try
+                {
+                    context.Logger.LogInformation($"Processing SQS message: {record.MessageId}");
+
+                    // Parse the notification message
+                    var notification = JsonSerializer.Deserialize<UnzipNotification>(record.Body);
+
+                    if (!notification.Success)
+                    {
+                        context.Logger.LogWarning($"Skipping failed unzip notification: {notification.ErrorMessage}");
+                        continue;
+                    }
+
+                    context.Logger.LogInformation($"Processing files from: {notification.SourceBucket}/{notification.ExtractedToFolder}");
+
+                    // Set Aspose license
+                    if (!SetAsposeLicense())
+                    {
+                        context.Logger.LogWarning("Failed to set Aspose license - running in evaluation mode");
+                    }
+
+                    // Read and process the index file from S3
+                    var indexPath = $"{notification.ExtractedToFolder}index";
+                    var parseResult = await ReadAndParseIndexFileFromS3(notification.SourceBucket, indexPath, context);
+
+                    if (parseResult.success)
+                    {
+                        context.Logger.LogInformation($"Successfully processed index file and created PDFs");
+                    }
+                    else
+                    {
+                        context.Logger.LogError($"Failed to process index file: {parseResult.error}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    context.Logger.LogError($"Error processing SQS message {record.MessageId}: {ex.Message}");
+                    throw; // Re-throw to trigger DLQ if configured
+                }
             }
         }
 
