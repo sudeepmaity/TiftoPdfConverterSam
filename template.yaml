@@ -23,11 +23,31 @@ Resources:
       ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
       KmsMasterKeyId: alias/aws/sqs  # Server-side encryption
 
+  # SQS Queue for PDF creation (FIFO queue for ordering)
+  PdfCreationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-pdf-creation.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 960
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      KmsMasterKeyId: alias/aws/sqs  # Server-side encryption
+
   # Dead Letter Queue for failed messages
   UnzipNotificationDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub '${AWS::StackName}-unzip-notifications-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  # Dead Letter Queue for PDF creation failures
+  PdfCreationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-pdf-creation-dlq'
       MessageRetentionPeriod: 1209600  # 14 days
       KmsMasterKeyId: alias/aws/sqs
 
@@ -110,12 +130,12 @@ Resources:
                 - sqs:GetQueueAttributes
               Resource: !GetAtt UnzipNotificationQueue.Arn
 
-  # TiffToPdfConverter function with explicit bucket references
-  TiffToPdfConverterFunction:
+  # GrouperFunction - processes unzip notifications and groups TIFF files
+  GrouperFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: ./src/TiffToPdfConverter/
-      Handler: TiffToPdfConverter::TiffToPdfConverter.Function::SqsFunctionHandler
+      CodeUri: ./src/GrouperFunction/
+      Handler: GrouperFunction::GrouperFunction.Function::SqsFunctionHandler
       Runtime: dotnet8
       Architectures:
         - x86_64
@@ -125,12 +145,60 @@ Resources:
           SOURCE_BUCKET: !Ref SourceBucket
           OUTPUT_BUCKET: !Ref OutputBucket
           OUTPUT_PREFIX: pdf
-          NOTIFICATION_QUEUE_URL: !Ref UnzipNotificationQueue
+          PDF_CREATION_QUEUE_URL: !Ref PdfCreationQueue
       Events:
-        SqsQueueEvent:
+        UnzipNotificationEvent:
           Type: SQS
           Properties:
             Queue: !GetAtt UnzipNotificationQueue.Arn
+            BatchSize: 1
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: AllowReadFromSourceBucket
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:GetObjectMetadata
+                - s3:ListBucket
+              Resource:
+                - !Sub '${SourceBucket.Arn}'
+                - !Sub '${SourceBucket.Arn}/*'
+            - Sid: AllowSQSSendMessage
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt PdfCreationQueue.Arn
+            - Sid: AllowSQSReceiveMessage
+              Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt UnzipNotificationQueue.Arn
+
+  # CreateMergedPdfFunction - processes grouped TIFF files and creates PDFs
+  CreateMergedPdfFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/CreateMergedPdfFunction/
+      Handler: CreateMergedPdfFunction::CreateMergedPdfFunction.Function::SqsFunctionHandler
+      Runtime: dotnet8
+      Architectures:
+        - x86_64
+      MemorySize: 512
+      Timeout: 600
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+          OUTPUT_PREFIX: pdf
+      Events:
+        PdfCreationEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PdfCreationQueue.Arn
             BatchSize: 1
       Policies:
         - Version: '2012-10-17'
@@ -165,7 +233,7 @@ Resources:
                 - sqs:ReceiveMessage
                 - sqs:DeleteMessage
                 - sqs:GetQueueAttributes
-              Resource: !GetAtt UnzipNotificationQueue.Arn
+              Resource: !GetAtt PdfCreationQueue.Arn
 
   ApplicationResourceGroup:
     Type: AWS::ResourceGroups::Group
@@ -183,12 +251,18 @@ Resources:
       AutoConfigurationEnabled: 'true'
 
 Outputs:
-  TiffToPdfConverterFunction:
-    Description: TIFF to PDF Converter Lambda Function ARN
-    Value: !GetAtt TiffToPdfConverterFunction.Arn
-  TiffToPdfConverterFunctionIamRole:
-    Description: Implicit IAM Role created for TIFF to PDF Converter function
-    Value: !GetAtt TiffToPdfConverterFunctionRole.Arn
+  GrouperFunction:
+    Description: Grouper Lambda Function ARN
+    Value: !GetAtt GrouperFunction.Arn
+  GrouperFunctionIamRole:
+    Description: Implicit IAM Role created for Grouper function
+    Value: !GetAtt GrouperFunctionRole.Arn
+  CreateMergedPdfFunction:
+    Description: Create Merged PDF Lambda Function ARN
+    Value: !GetAtt CreateMergedPdfFunction.Arn
+  CreateMergedPdfFunctionIamRole:
+    Description: Implicit IAM Role created for Create Merged PDF function
+    Value: !GetAtt CreateMergedPdfFunctionRole.Arn
   SourceBucketName:
     Description: S3 bucket name for zip files and extracted content
     Value: !Ref SourceBucket
@@ -204,3 +278,9 @@ Outputs:
   UnzipNotificationQueueArn:
     Description: SQS Queue ARN for unzip completion notifications
     Value: !GetAtt UnzipNotificationQueue.Arn
+  PdfCreationQueueUrl:
+    Description: SQS Queue URL for PDF creation requests
+    Value: !Ref PdfCreationQueue
+  PdfCreationQueueArn:
+    Description: SQS Queue ARN for PDF creation requests
+    Value: !GetAtt PdfCreationQueue.Arn

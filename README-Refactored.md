@@ -1,183 +1,151 @@
-# TiffToPdfConverter - Refactored Architecture
+# TiftoPdfConverterSam - Refactored Architecture
 
-## Overview
+This project contains source code and supporting files for a refactored serverless application that processes ZIP files containing TIFF images and converts them to merged PDF documents using AWS Lambda, SQS, and S3.
 
-The TiffToPdfConverter project has been refactored to implement a modern S3-based architecture with automatic zip file processing capabilities. The system now supports both legacy local file processing and new cloud-native S3-based workflows.
+## Architecture Overview
 
-## New Architecture
+The application uses a **modular, event-driven architecture** with separate Lambda functions for different processing stages:
 
-### Components
+### Current Refactored Flow
 
-1. **Source S3 Bucket** - Contains two main folders:
-   - `zip/` - Upload location for zip files
-   - `unzip/` - Automatic extraction destination
+1. **User uploads ZIP file** → S3 Source Bucket (zip/ folder)
+2. **ZipExtractorFunction** (Lambda) extracts contents to S3 Source Bucket (extracted/ folder) and sends completion message to UnzipNotificationQueue (SQS)
+3. **SQS event triggers GrouperFunction** (Lambda)
+   - Groups TIFF files by pattern (batch_number + item_number)
+   - Sends one SQS message per group to PdfCreationQueue
+4. **New SQS Queue triggers CreateMergedPdfFunction** (Lambda)
+   - Processes the TIFF group message
+   - Creates merged PDF per group
+   - Saves output to S3 Output Bucket (pdf/ folder)
 
-2. **ZipExtractorFunction** - Lambda function for automatic zip extraction
-3. **TiffToPdfConverterFunction** - Enhanced with S3 support for processing extracted files
-4. **Output S3 Bucket** - Destination for generated PDF files
+### Key Components
 
-### Workflow
+- **src/ZipExtractorFunction/** - Extracts uploaded ZIP files
+- **src/GrouperFunction/** - Groups TIFF files by pattern and sends group messages
+- **src/CreateMergedPdfFunction/** - Creates merged PDFs from grouped TIFF files
+- **template.yaml** - AWS SAM template defining all resources
 
-```mermaid
-graph TD
-    A[Upload ZIP to source bucket zip/ folder] --> B[S3 Event Trigger]
-    B --> C[ZipExtractorFunction]
-    C --> D[Extract contents to unzip/ folder]
-    D --> E[TiffToPdfConverterFunction processes extracted files]
-    E --> F[Generated PDFs stored in output bucket]
-```
+## AWS Resources
 
-## Infrastructure
+- **2 Lambda Functions**: GrouperFunction, CreateMergedPdfFunction
+- **2 SQS Queues**: UnzipNotificationQueue, PdfCreationQueue (FIFO)
+- **2 S3 Buckets**: Source bucket (zip files + extracted content), Output bucket (PDFs)
+- **Dead Letter Queues**: For failed message handling
 
-### S3 Buckets
+## Key Improvements
 
-- **SourceBucket**: Main bucket with automatic Lambda triggering
-  - `zip/` folder: Upload zip files here
-  - `unzip/` folder: Automatically populated with extracted content
-- **OutputBucket**: Stores generated PDF files with encryption
+### Modularity
+- **Separation of Concerns**: Each function has a single responsibility
+- **Independent Scaling**: Functions can scale independently based on workload
+- **Easier Testing**: Each component can be tested in isolation
 
-### Lambda Functions
+### Reliability
+- **FIFO Queue**: Ensures ordered processing of groups
+- **Dead Letter Queues**: Handles failed messages gracefully
+- **Fine-grained Error Handling**: Better error isolation and recovery
 
-#### ZipExtractorFunction
-- **Trigger**: S3 ObjectCreated events on `zip/*.zip` files
-- **Runtime**: .NET 8
-- **Memory**: 512 MB
-- **Timeout**: 5 minutes
-- **Purpose**: Automatically extracts zip files and stores contents in `unzip/` folder
-
-#### TiffToPdfConverterFunction
-- **Trigger**: API Gateway (manual invocation)
-- **Runtime**: .NET 8
-- **Memory**: 256 MB
-- **Timeout**: 15 minutes
-- **Purpose**: Processes TIFF files and generates merged PDFs
-- **Modes**: 
-  - Legacy local file processing
-  - New S3-based processing
-
-## Usage
-
-### S3-Based Processing (Recommended)
-
-1. **Upload zip file** to the source bucket's `zip/` folder
-2. **ZipExtractorFunction automatically triggers** and extracts contents to `unzip/`
-3. **Invoke TiffToPdfConverterFunction** with S3 parameters:
-
-```json
-{
-    "useS3": true,
-    "s3Path": "source-bucket-name/unzip/your-extracted-folder",
-    "path": ""
-}
-```
-
-### Legacy Local Processing
-
-For backwards compatibility, the original local file processing is still supported:
-
-```json
-{
-    "path": "Start",
-    "useS3": false
-}
-```
-
-## API Usage Examples
-
-### S3-Based Processing
-```bash
-curl -X PUT https://your-api-gateway-url/Prod/processcsv \
-  -H "Content-Type: application/json" \
-  -d '{
-    "useS3": true,
-    "s3Path": "my-source-bucket/unzip/extracted-files",
-    "path": ""
-  }'
-```
-
-### Local Processing (Legacy)
-```bash
-curl -X PUT https://your-api-gateway-url/Prod/processcsv \
-  -H "Content-Type: application/json" \
-  -d '{
-    "path": "Start",
-    "useS3": false
-  }'
-```
-
-## Environment Variables
-
-### ZipExtractorFunction
-- `SOURCE_BUCKET`: Name of the source S3 bucket
-
-### TiffToPdfConverterFunction
-- `SOURCE_BUCKET`: Name of the source S3 bucket (for S3 mode)
-- `OUTPUT_BUCKET`: Name of the output S3 bucket
-- `OUTPUT_PREFIX`: Prefix for generated PDF files (default: "pdf")
+### Performance
+- **Parallel Processing**: Multiple PDF creation functions can run simultaneously
+- **Smaller Function Size**: Faster cold start times
+- **Resource Optimization**: Each function optimized for its specific task
 
 ## Deployment
 
-### Prerequisites
-- AWS CLI configured
-- SAM CLI installed
-- .NET 8 SDK
+The Serverless Application Model Command Line Interface (SAM CLI) is used for deployment:
 
-### Deploy the Stack
 ```bash
 sam build
 sam deploy --guided
 ```
 
-### Post-Deployment Steps
-1. Note the output bucket names from the CloudFormation outputs
-2. Upload your TIFF files in a zip archive to the source bucket's `zip/` folder
-3. The system will automatically extract and process the files
+### Prerequisites
 
-## File Structure
+- SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
+- .NET Core - [Install .NET Core](https://www.microsoft.com/net/download)
+- Docker - [Install Docker community edition](https://hub.docker.com/search/?type=edition&offering=community)
 
-```
-TiftoPdfConverterSam/
-├── src/
-│   ├── TiffToPdfConverter/           # Enhanced PDF converter function
-│   └── ZipExtractorFunction/         # New zip extraction function
-├── test/
-│   ├── TiffToPdfConverter.Test/      # Tests for PDF converter
-│   └── ZipExtractorFunction.Test/    # Tests for zip extractor
-├── template.yaml                     # SAM template with new infrastructure
-└── README-Refactored.md             # This file
+## Local Testing
+
+Build your application:
+```bash
+sam build
 ```
 
-## Benefits of Refactored Architecture
+Test individual functions:
+```bash
+# Test GrouperFunction
+sam local invoke GrouperFunction --event events/unzip-notification.json
 
-1. **Scalability**: Cloud-native S3-based processing
-2. **Automation**: Automatic zip file extraction
-3. **Reliability**: Event-driven architecture with built-in retry mechanisms
-4. **Security**: Encrypted S3 storage and secure Lambda execution
-5. **Monitoring**: CloudWatch integration for logging and metrics
-6. **Backwards Compatibility**: Legacy local processing still supported
+# Test CreateMergedPdfFunction  
+sam local invoke CreateMergedPdfFunction --event events/tiff-group.json
+```
 
-## Migration Guide
+Run the API locally:
+```bash
+sam local start-api
+```
 
-For existing users:
-1. The legacy API still works exactly as before
-2. To use new S3 features, update your API calls to include `"useS3": true`
-3. Upload files to the new S3 buckets instead of packaging them locally
+## Environment Variables
 
-## Security
+### GrouperFunction
+- `SOURCE_BUCKET`: S3 bucket for extracted files
+- `OUTPUT_BUCKET`: S3 bucket for final PDFs
+- `OUTPUT_PREFIX`: Prefix for PDF files (default: "pdf")
+- `PDF_CREATION_QUEUE_URL`: SQS queue URL for PDF creation requests
 
-- All S3 buckets use AES-256 encryption
-- Public access is blocked on all buckets
-- Lambda functions have minimal required IAM permissions
-- Network traffic is secured through VPC when needed
+### CreateMergedPdfFunction
+- `SOURCE_BUCKET`: S3 bucket for TIFF files
+- `OUTPUT_BUCKET`: S3 bucket for final PDFs  
+- `OUTPUT_PREFIX`: Prefix for PDF files (default: "pdf")
 
-## Monitoring and Troubleshooting
+## Monitoring and Logging
 
-- Check CloudWatch logs for both Lambda functions
-- Monitor S3 bucket metrics for upload/download patterns
-- Use AWS X-Ray for distributed tracing (enabled by default)
+- **CloudWatch Logs**: Each function has dedicated log groups
+- **AWS X-Ray**: Distributed tracing enabled
+- **Application Insights**: Automatic monitoring configuration
 
-## Cost Optimization
+## File Processing Logic
 
-- Lambda functions are configured with appropriate memory and timeout settings
-- S3 storage classes can be configured for cost optimization
-- Evaluation mode limits (4 pages per PDF) help control processing costs
+### Grouping Strategy
+Files are grouped by `batch_number` and `item_number` extracted from the index file:
+- **Pattern**: `{batch_number}_{item_number}` 
+- **File Types**: Both "C" (check) and "M" (memo) files are included in each group
+- **Output**: One merged PDF per group containing all TIFF images
+
+### Index File Format
+The index file is expected to be a CSV with columns:
+1. `batch_number` - Batch identifier
+2. `item_number` - Item identifier  
+3. `payment_type` - "C" or "M"
+4. `file_name` - TIFF filename (without extension)
+
+## Cleanup
+
+To delete the application:
+```bash
+sam delete --stack-name TiftoPdfConverterSam
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **FIFO Queue Configuration**: Ensure MessageGroupId and MessageDeduplicationId are properly set
+2. **Aspose License**: Place license file in function directory for production use
+3. **Memory Limits**: CreateMergedPdfFunction uses more memory (512MB) for PDF processing
+4. **File Extensions**: Function automatically tries .tif, .tiff, .TIF, .TIFF extensions
+
+### Monitoring
+
+View function logs:
+```bash
+sam logs -n GrouperFunction --stack-name TiftoPdfConverterSam --tail
+sam logs -n CreateMergedPdfFunction --stack-name TiftoPdfConverterSam --tail
+```
+
+## Resources
+
+- [AWS SAM developer guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/what-is-sam.html)
+- [AWS Lambda Documentation](https://docs.aws.amazon.com/lambda/)
+- [Amazon SQS Developer Guide](https://docs.aws.amazon.com/sqs/)
+- [Aspose.PDF Documentation](https://docs.aspose.com/pdf/net/)
